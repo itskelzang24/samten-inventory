@@ -60,6 +60,17 @@ import {
   LifeBuoy
 } from 'lucide-react';
 
+// --- Configuration ---
+
+/** 
+ * PASTE YOUR GOOGLE APPS SCRIPT URL HERE 
+ * This allows the app to work immediately when shared.
+ */
+const DEFAULT_SYNC_URL = ""; 
+
+/** Session timeout in milliseconds (5 minutes) */
+const IDLE_TIMEOUT = 5 * 60 * 1000; 
+
 // --- Types ---
 
 type UserRole = 'Owner' | 'Staff';
@@ -197,7 +208,7 @@ const LoginView = ({ onLogin, isSyncing, onSync, onResetUrl }: { onLogin: (user:
               <Boxes size={32} />
             </div>
             <h1 className="text-3xl font-black text-slate-900 tracking-tight">Samten</h1>
-            <p className="text-slate-500 text-sm font-medium">Inventory V11.1</p>
+            <p className="text-slate-500 text-sm font-medium">Inventory V11.2</p>
           </div>
 
           <form onSubmit={handleSubmit} className="space-y-6">
@@ -254,7 +265,7 @@ const LoginView = ({ onLogin, isSyncing, onSync, onResetUrl }: { onLogin: (user:
           
           <div className="mt-8 pt-6 border-t border-slate-100 flex flex-col items-center gap-4 text-center">
              <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">
-                Cloud Authenticated
+                Secure Session Active
              </p>
              <button 
               onClick={() => { if(confirm("Clear Cloud Link?")) onResetUrl(); }}
@@ -308,7 +319,7 @@ const App = () => {
   
   const [apiUrl, setApiUrl] = useState<string>(() => {
     const stored = localStorage.getItem('samten_api_url_secure');
-    return stored ? decodeUrl(stored) : '';
+    return stored ? decodeUrl(stored) : DEFAULT_SYNC_URL;
   });
   const [isSyncing, setIsSyncing] = useState(false);
   const [lastSync, setLastSync] = useState<Date | null>(null);
@@ -326,6 +337,32 @@ const App = () => {
     }
     return id;
   };
+
+  // --- Session Timeout Logic ---
+  useEffect(() => {
+    if (!currentUser) return;
+
+    let timeoutId: number;
+
+    const resetTimer = () => {
+      if (timeoutId) clearTimeout(timeoutId);
+      timeoutId = window.setTimeout(() => {
+        handleLogout();
+        showToast("Session Expired due to inactivity", "error");
+      }, IDLE_TIMEOUT);
+    };
+
+    // Events to track activity
+    const events = ['mousedown', 'mousemove', 'keypress', 'scroll', 'touchstart'];
+    events.forEach(event => document.addEventListener(event, resetTimer));
+
+    resetTimer(); // Start timer
+
+    return () => {
+      if (timeoutId) clearTimeout(timeoutId);
+      events.forEach(event => document.removeEventListener(event, resetTimer));
+    };
+  }, [currentUser]);
 
   const syncData = async () => {
     if (!apiUrl) return;
@@ -425,8 +462,6 @@ const App = () => {
         mode: 'no-cors',
         body: JSON.stringify(txData)
       });
-      // no-cors fetch resolves immediately. 
-      // Ensure we clear the info toast before proceeding.
       removeToast(infoToastId);
       showToast("Synced!", "success");
       setTimeout(syncData, 1000); 
@@ -538,7 +573,7 @@ const App = () => {
           <h1 className="text-2xl font-black tracking-tight text-white flex items-center gap-2">
             <Boxes className="text-blue-500" size={24} /> Samten
           </h1>
-          <p className="text-slate-500 text-[10px] font-bold uppercase tracking-widest mt-1">V11.1 Sync Fixed</p>
+          <p className="text-slate-500 text-[10px] font-bold uppercase tracking-widest mt-1">V11.2 Secure Session</p>
         </div>
         
         <nav className="flex-1 px-4 py-8 space-y-1.5 overflow-y-auto">
@@ -580,7 +615,7 @@ const App = () => {
           <div className="flex items-center gap-3">
              <h2 className="text-xl font-black text-slate-900 uppercase tracking-tight">{activeTab}</h2>
              <span className="h-4 w-[1px] bg-slate-200"></span>
-             <p className="text-xs text-slate-400 font-medium">Session: {currentUser.username}</p>
+             <p className="text-xs text-slate-400 font-medium">Auto-timeout active (5m)</p>
           </div>
           <div className="flex gap-4">
             {lastSync && <span className="text-[10px] text-slate-400 font-bold uppercase">Cloud Sync: {lastSync.toLocaleTimeString()}</span>}
@@ -642,7 +677,7 @@ const SetupView = ({ onShowToast, apiUrl, setApiUrl, onSync, isSyncing, currentU
   };
 
   const appsScriptCode = `/**
- * Samten Cloud Connector (V11.1 - Unique Toast Fix)
+ * Samten Cloud Connector (V11.2 - Timeout Ready)
  * Required sheets:
  * Products: ID | Name | Category | Unit | Cost | Selling | Stock | MinStock | Supplier
  * Sales_Transactions: Date | ItemID | ItemName | Qty | Rate | GST(5%) | Total | Method | User
@@ -793,9 +828,9 @@ function updateRow(sheetName, id, rowData) {
       </div>
 
       <div className="p-8 bg-blue-50 border-2 border-dashed border-blue-200 rounded-[2rem] text-blue-900">
-         <h4 className="font-black mb-2 flex items-center gap-2 text-sm"><Info size={18} /> Global Sync (V11.1)</h4>
+         <h4 className="font-black mb-2 flex items-center gap-2 text-sm"><Info size={18} /> Auto-Sync (V11.2)</h4>
          <p className="text-xs leading-relaxed font-medium">
-            Staff access rules are stored in <strong>System_Config</strong>. When you update permissions, they sync across all logged-in devices.
+            System includes a <strong>5-minute idle timeout</strong> for enhanced security. The default Cloud URL is hardcoded for immediate use.
          </p>
       </div>
 
@@ -841,7 +876,7 @@ function updateRow(sheetName, id, rowData) {
         <div className="px-8 py-5 bg-slate-800 border-b border-slate-700 flex justify-between items-center">
           <div className="flex items-center gap-3 text-white">
             <Terminal size={18} className="text-blue-400" />
-            <h4 className="font-bold text-sm text-slate-200">Apps Script V11.1</h4>
+            <h4 className="font-bold text-sm text-slate-200">Apps Script Source</h4>
           </div>
           <button 
             onClick={() => { navigator.clipboard.writeText(appsScriptCode); onShowToast("Script Copied!"); }} 
