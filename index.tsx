@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { createRoot } from 'react-dom/client';
 import { 
@@ -57,16 +58,18 @@ import {
   Hash,
   Key,
   Loader2,
-  LifeBuoy
+  LifeBuoy,
+  Wifi,
+  WifiOff
 } from 'lucide-react';
 
 // --- Configuration ---
 
 /** 
- * PASTE YOUR GOOGLE APPS SCRIPT URL HERE 
- * This allows the app to work immediately when shared.
+ * HARDCODED SYNC CONNECTOR
+ * Your specific Google Apps Script URL for global cross-device sync.
  */
-const DEFAULT_SYNC_URL = ""; 
+const DEFAULT_SYNC_URL = "https://script.google.com/macros/s/AKfycbyJQ4PkVvuauaYKX-cqOzUOeYKA_d7Nlhy-FIqxkPAPhfleVQsIFId43SFXdPgjjgdl2g/exec"; 
 
 /** Session timeout in milliseconds (5 minutes) */
 const IDLE_TIMEOUT = 5 * 60 * 1000; 
@@ -135,6 +138,11 @@ const encodeUrl = (url: string) => btoa(url);
 const decodeUrl = (encoded: string) => {
   try { return atob(encoded); } catch { return ''; }
 };
+
+// --- Storage Keys ---
+const STORAGE_KEY_USER = 'samten_session_user';
+const STORAGE_KEY_ACTIVITY = 'samten_last_activity';
+const STORAGE_KEY_API_URL = 'samten_api_url_secure';
 
 // --- Export Helper ---
 
@@ -208,7 +216,7 @@ const LoginView = ({ onLogin, isSyncing, onSync, onResetUrl }: { onLogin: (user:
               <Boxes size={32} />
             </div>
             <h1 className="text-3xl font-black text-slate-900 tracking-tight">Samten</h1>
-            <p className="text-slate-500 text-sm font-medium">Inventory V11.2</p>
+            <p className="text-slate-500 text-sm font-medium">Inventory V11.5 Global Sync</p>
           </div>
 
           <form onSubmit={handleSubmit} className="space-y-6">
@@ -265,13 +273,13 @@ const LoginView = ({ onLogin, isSyncing, onSync, onResetUrl }: { onLogin: (user:
           
           <div className="mt-8 pt-6 border-t border-slate-100 flex flex-col items-center gap-4 text-center">
              <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">
-                Secure Session Active
+                Connected to Cloud
              </p>
              <button 
-              onClick={() => { if(confirm("Clear Cloud Link?")) onResetUrl(); }}
+              onClick={() => { if(confirm("Clear Global Sync Link?")) onResetUrl(); }}
               className="text-[10px] text-red-400 font-black uppercase hover:text-red-600 transition-colors tracking-widest"
             >
-              Reset Cloud Link
+              Reset Target URL
             </button>
           </div>
         </div>
@@ -306,10 +314,30 @@ const ToastContainer = ({ toasts, removeToast }: { toasts: ToastMessage[], remov
 // --- App ---
 
 const App = () => {
-  const [currentUser, setCurrentUser] = useState<AppUser | null>(null);
+  // Session Persistence Initializer
+  const [currentUser, setCurrentUser] = useState<AppUser | null>(() => {
+    const stored = localStorage.getItem(STORAGE_KEY_USER);
+    if (!stored) return null;
+    
+    const lastActive = localStorage.getItem(STORAGE_KEY_ACTIVITY);
+    if (!lastActive) {
+      // If user exists but no activity record, start one now
+      localStorage.setItem(STORAGE_KEY_ACTIVITY, Date.now().toString());
+      return JSON.parse(stored);
+    }
+    
+    // Check if session is already expired on initial load
+    if (Date.now() - parseInt(lastActive) > IDLE_TIMEOUT) {
+      localStorage.removeItem(STORAGE_KEY_USER);
+      localStorage.removeItem(STORAGE_KEY_ACTIVITY);
+      return null;
+    }
+    return JSON.parse(stored);
+  });
+
   const [activeTab, setActiveTab] = useState<TabType>('dashboard');
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
-  const toastCounter = useRef(0);
+  const toastIdCounter = useRef(0);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   
   const [products, setProducts] = useState<Product[]>([]);
@@ -318,9 +346,12 @@ const App = () => {
   const [showLowStockModal, setShowLowStockModal] = useState(false);
   
   const [apiUrl, setApiUrl] = useState<string>(() => {
-    const stored = localStorage.getItem('samten_api_url_secure');
-    return stored ? decodeUrl(stored) : DEFAULT_SYNC_URL;
+    const stored = localStorage.getItem(STORAGE_KEY_API_URL);
+    const decoded = stored ? decodeUrl(stored) : '';
+    // Priority: Local Storage Override > Hardcoded Global Link
+    return decoded || DEFAULT_SYNC_URL;
   });
+
   const [isSyncing, setIsSyncing] = useState(false);
   const [lastSync, setLastSync] = useState<Date | null>(null);
 
@@ -329,38 +360,42 @@ const App = () => {
   };
 
   const showToast = (message: string, type: 'success' | 'error' | 'info' = 'success') => {
-    toastCounter.current += 1;
-    const id = toastCounter.current;
-    setToasts(prev => [...prev, { id, message, type }]);
+    toastIdCounter.current += 1;
+    const currentId = toastIdCounter.current;
+    setToasts(prev => [...prev, { id: currentId, message, type }]);
     if (type !== 'info') {
-      setTimeout(() => removeToast(id), 4000);
+      setTimeout(() => removeToast(currentId), 4000);
     }
-    return id;
+    return currentId;
   };
 
-  // --- Session Timeout Logic ---
+  // --- Session Persistence & Idle Timeout ---
   useEffect(() => {
     if (!currentUser) return;
 
-    let timeoutId: number;
-
-    const resetTimer = () => {
-      if (timeoutId) clearTimeout(timeoutId);
-      timeoutId = window.setTimeout(() => {
-        handleLogout();
-        showToast("Session Expired due to inactivity", "error");
-      }, IDLE_TIMEOUT);
+    const updateActivity = () => {
+      localStorage.setItem(STORAGE_KEY_ACTIVITY, Date.now().toString());
     };
 
-    // Events to track activity
-    const events = ['mousedown', 'mousemove', 'keypress', 'scroll', 'touchstart'];
-    events.forEach(event => document.addEventListener(event, resetTimer));
+    const checkIdle = () => {
+      const lastActive = parseInt(localStorage.getItem(STORAGE_KEY_ACTIVITY) || '0');
+      if (Date.now() - lastActive > IDLE_TIMEOUT) {
+        handleLogout();
+        showToast("Session Expired (Idle 5m)", "error");
+      }
+    };
 
-    resetTimer(); // Start timer
+    // Mark current time as active on load
+    updateActivity();
+    
+    const events = ['mousedown', 'mousemove', 'keypress', 'scroll', 'touchstart'];
+    events.forEach(ev => window.addEventListener(ev, updateActivity));
+
+    const idleInterval = setInterval(checkIdle, 10000); // Check every 10s
 
     return () => {
-      if (timeoutId) clearTimeout(timeoutId);
-      events.forEach(event => document.removeEventListener(event, resetTimer));
+      events.forEach(ev => window.removeEventListener(ev, updateActivity));
+      clearInterval(idleInterval);
     };
   }, [currentUser]);
 
@@ -439,38 +474,46 @@ const App = () => {
   };
 
   useEffect(() => {
-    if (apiUrl) {
+    if (apiUrl && currentUser) {
       syncData();
       const interval = setInterval(syncData, 60000);
       return () => clearInterval(interval);
     }
-  }, [apiUrl]);
+  }, [apiUrl, currentUser]);
 
   const handleResetUrl = () => {
-    setApiUrl('');
-    localStorage.removeItem('samten_api_url_secure');
-    setCurrentUser(null);
-    showToast("System Link Reset.");
+    setApiUrl(DEFAULT_SYNC_URL);
+    localStorage.removeItem(STORAGE_KEY_API_URL);
+    handleLogout();
+    showToast("Global Sync Reset.");
   };
 
   const pushTransaction = async (txData: any) => {
     if (!apiUrl) return false;
-    const infoToastId = showToast("Updating Cloud...", "info");
+    const progressId = showToast("Updating Cloud...", "info");
+    
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 12000);
+
     try {
       await fetch(apiUrl, {
         method: 'POST',
         mode: 'no-cors',
-        body: JSON.stringify(txData)
+        body: JSON.stringify(txData),
+        signal: controller.signal
       });
-      removeToast(infoToastId);
-      showToast("Synced!", "success");
+      removeToast(progressId);
+      showToast("Cloud Updated!", "success");
       setTimeout(syncData, 1000); 
       return true;
-    } catch (e) {
+    } catch (e: any) {
       console.error(e);
-      removeToast(infoToastId);
-      showToast("Update Failed", "error");
+      removeToast(progressId);
+      if (e.name === 'AbortError') showToast("Sync Timeout", "error");
+      else showToast("Cloud Sync Error", "error");
       return false;
+    } finally {
+      clearTimeout(timeoutId);
     }
   };
 
@@ -518,12 +561,16 @@ const App = () => {
 
   const handleLogout = () => {
     setCurrentUser(null);
+    localStorage.removeItem(STORAGE_KEY_USER);
+    localStorage.removeItem(STORAGE_KEY_ACTIVITY);
     setActiveTab('dashboard');
     setIsSidebarOpen(false);
   };
 
   const handleLogin = (user: AppUser) => {
     setCurrentUser(user);
+    localStorage.setItem(STORAGE_KEY_USER, JSON.stringify(user));
+    localStorage.setItem(STORAGE_KEY_ACTIVITY, Date.now().toString());
     if (apiUrl) syncData();
   };
 
@@ -573,7 +620,7 @@ const App = () => {
           <h1 className="text-2xl font-black tracking-tight text-white flex items-center gap-2">
             <Boxes className="text-blue-500" size={24} /> Samten
           </h1>
-          <p className="text-slate-500 text-[10px] font-bold uppercase tracking-widest mt-1">V11.2 Secure Session</p>
+          <p className="text-slate-500 text-[10px] font-bold uppercase tracking-widest mt-1">V11.5 Global Connector</p>
         </div>
         
         <nav className="flex-1 px-4 py-8 space-y-1.5 overflow-y-auto">
@@ -604,6 +651,13 @@ const App = () => {
               <p className={`text-[10px] font-bold uppercase ${currentUser.role === 'Owner' ? 'text-blue-400' : 'text-slate-500'}`}>{currentUser.role}</p>
             </div>
           </div>
+          <div className="flex items-center justify-between mb-4 px-2">
+             <div className="flex items-center gap-2">
+                <div className={`w-2 h-2 rounded-full ${lastSync ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`}></div>
+                <span className="text-[10px] font-black text-slate-400 tracking-widest uppercase">{lastSync ? 'Linked' : 'Offline'}</span>
+             </div>
+             {lastSync && <span className="text-[10px] text-slate-600 font-bold">{lastSync.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</span>}
+          </div>
           <button onClick={handleLogout} className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-red-500/10 hover:bg-red-50 text-red-500 hover:text-white rounded-xl text-xs font-bold transition-all">
             <LogOut size={14} /> Sign Out
           </button>
@@ -615,10 +669,10 @@ const App = () => {
           <div className="flex items-center gap-3">
              <h2 className="text-xl font-black text-slate-900 uppercase tracking-tight">{activeTab}</h2>
              <span className="h-4 w-[1px] bg-slate-200"></span>
-             <p className="text-xs text-slate-400 font-medium">Auto-timeout active (5m)</p>
+             <p className="text-xs text-slate-400 font-medium tracking-tight">User: {currentUser.username}</p>
           </div>
           <div className="flex gap-4">
-            {lastSync && <span className="text-[10px] text-slate-400 font-bold uppercase">Cloud Sync: {lastSync.toLocaleTimeString()}</span>}
+             {apiUrl === DEFAULT_SYNC_URL && <span className="bg-blue-50 text-blue-600 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest border border-blue-100">Global Sync Active</span>}
           </div>
         </header>
 
@@ -628,7 +682,7 @@ const App = () => {
           {activeTab === 'restock' && <RestockView products={products} onRestock={handleRestock} user={currentUser.name} />}
           {activeTab === 'inventory' && <InventoryView products={products} onAdd={handleAddProduct} onEdit={handleEditProduct} />}
           {activeTab === 'reports' && <ReportsView transactions={transactions} />}
-          {activeTab === 'setup' && <SetupView onShowToast={showToast} apiUrl={apiUrl} setApiUrl={(url: string) => { setApiUrl(url); localStorage.setItem('samten_api_url_secure', encodeUrl(url)); }} onSync={syncData} isSyncing={isSyncing} currentUser={currentUser} />}
+          {activeTab === 'setup' && <SetupView onShowToast={showToast} apiUrl={apiUrl} setApiUrl={(url: string) => { setApiUrl(url); localStorage.setItem(STORAGE_KEY_API_URL, encodeUrl(url)); }} onSync={syncData} isSyncing={isSyncing} currentUser={currentUser} />}
           {activeTab === 'access' && <AccessControlView permissions={staffPermissions} onUpdatePermissions={handleUpdateCloudPermissions} onShowToast={showToast} />}
         </main>
       </div>
@@ -677,12 +731,8 @@ const SetupView = ({ onShowToast, apiUrl, setApiUrl, onSync, isSyncing, currentU
   };
 
   const appsScriptCode = `/**
- * Samten Cloud Connector (V11.2 - Timeout Ready)
- * Required sheets:
- * Products: ID | Name | Category | Unit | Cost | Selling | Stock | MinStock | Supplier
- * Sales_Transactions: Date | ItemID | ItemName | Qty | Rate | GST(5%) | Total | Method | User
- * Purchase_Transactions: Date | ItemID | ItemName | Qty | Cost | Total | BillNo | Supplier | User
- * System_Config: Key | Value
+ * Samten Cloud Connector (V11.5 - Secure)
+ * Multi-device sync handler.
  */
 
 const SHEET_NAME_PRODUCTS = "Products";
@@ -821,16 +871,16 @@ function updateRow(sheetName, id, rowData) {
               onClick={() => setIsVerifying(true)}
               className="w-full py-3 bg-white text-slate-900 rounded-xl font-bold text-xs hover:bg-blue-50 transition-all flex items-center justify-center gap-2"
             >
-               <Save size={16} /> Update Link
+               <Save size={16} /> Override Link
             </button>
           </div>
         </div>
       </div>
 
       <div className="p-8 bg-blue-50 border-2 border-dashed border-blue-200 rounded-[2rem] text-blue-900">
-         <h4 className="font-black mb-2 flex items-center gap-2 text-sm"><Info size={18} /> Auto-Sync (V11.2)</h4>
+         <h4 className="font-black mb-2 flex items-center gap-2 text-sm"><Info size={18} /> Persistent Cloud (V11.5)</h4>
          <p className="text-xs leading-relaxed font-medium">
-            System includes a <strong>5-minute idle timeout</strong> for enhanced security. The default Cloud URL is hardcoded for immediate use.
+            Shared devices now automatically pick up the hardcoded sync link. Session state persists across browser refreshes for 5 minutes.
          </p>
       </div>
 
@@ -841,31 +891,20 @@ function updateRow(sheetName, id, rowData) {
                 <ShieldAlert size={28} />
              </div>
              <h4 className="text-xl font-black text-slate-900 mb-2">Auth Required</h4>
-             <p className="text-sm text-slate-500 mb-6">Enter password to apply cloud changes.</p>
+             <p className="text-sm text-slate-500 mb-6">Enter password to apply system-wide changes.</p>
              <form onSubmit={confirmUpdate} className="space-y-4">
                 <input 
                   autoFocus
                   type="password"
-                  placeholder="Enter Password"
+                  placeholder="Password"
                   required
                   className="w-full p-4 bg-slate-50 border border-slate-200 rounded-2xl text-sm font-bold outline-none focus:ring-4 focus:ring-blue-100 transition-all"
                   value={passwordConfirm}
                   onChange={e => setPasswordConfirm(e.target.value)}
                 />
                 <div className="flex gap-3">
-                   <button 
-                    type="button" 
-                    onClick={() => setIsVerifying(false)} 
-                    className="flex-1 py-4 bg-slate-100 text-slate-600 font-black rounded-2xl text-xs uppercase tracking-widest hover:bg-slate-200"
-                   >
-                     Cancel
-                   </button>
-                   <button 
-                    type="submit" 
-                    className="flex-[2] py-4 bg-slate-900 text-white font-black rounded-2xl text-xs uppercase tracking-widest shadow-lg active:scale-95"
-                   >
-                     Apply
-                   </button>
+                   <button type="button" onClick={() => setIsVerifying(false)} className="flex-1 py-4 bg-slate-100 text-slate-600 font-black rounded-2xl text-xs uppercase hover:bg-slate-200">Cancel</button>
+                   <button type="submit" className="flex-[2] py-4 bg-slate-900 text-white font-black rounded-2xl text-xs uppercase shadow-lg active:scale-95">Confirm</button>
                 </div>
              </form>
           </div>
@@ -876,12 +915,9 @@ function updateRow(sheetName, id, rowData) {
         <div className="px-8 py-5 bg-slate-800 border-b border-slate-700 flex justify-between items-center">
           <div className="flex items-center gap-3 text-white">
             <Terminal size={18} className="text-blue-400" />
-            <h4 className="font-bold text-sm text-slate-200">Apps Script Source</h4>
+            <h4 className="font-bold text-sm text-slate-200">Apps Script Source (V11.5)</h4>
           </div>
-          <button 
-            onClick={() => { navigator.clipboard.writeText(appsScriptCode); onShowToast("Script Copied!"); }} 
-            className="flex items-center gap-2 px-5 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-black transition-all"
-          >
+          <button onClick={() => { navigator.clipboard.writeText(appsScriptCode); onShowToast("Script Copied!"); }} className="flex items-center gap-2 px-5 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-black transition-all">
             <Copy size={14} /> Copy Script
           </button>
         </div>
@@ -916,7 +952,7 @@ const DashboardView = ({ lowStockItems, totalSales, grossProfit, transactions, p
           <>
             <div className="bg-white p-6 rounded-[1.5rem] border border-slate-100 flex items-center justify-between shadow-sm">
               <div>
-                <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Gross Revenue</p>
+                <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Total Revenue</p>
                 <h3 className="text-2xl font-black text-slate-900">{formatCurrency(totalSales)}</h3>
               </div>
               <div className="p-3 bg-green-50 rounded-2xl text-green-600"><TrendingUp size={24} /></div>
@@ -932,8 +968,8 @@ const DashboardView = ({ lowStockItems, totalSales, grossProfit, transactions, p
         )}
         <button onClick={onAlertClick} className={`bg-white p-6 rounded-[1.5rem] border border-red-50 flex items-center justify-between shadow-sm hover:bg-red-50/50 transition-colors ${!isOwner ? 'w-full' : ''}`}>
           <div>
-            <p className="text-[10px] font-black text-red-400 uppercase tracking-widest mb-1">Alerts</p>
-            <h3 className="text-2xl font-black text-red-600">{lowStockItems.length} Issues</h3>
+            <p className="text-[10px] font-black text-red-400 uppercase tracking-widest mb-1">Health Alerts</p>
+            <h3 className="text-2xl font-black text-red-600">{lowStockItems.length} Warnings</h3>
           </div>
           <div className="p-3 bg-red-50 rounded-2xl text-red-600"><AlertTriangle size={24} /></div>
         </button>
@@ -943,8 +979,8 @@ const DashboardView = ({ lowStockItems, totalSales, grossProfit, transactions, p
         <div className="xl:col-span-2 bg-white p-8 rounded-[2rem] border border-slate-100 shadow-sm">
           <div className="flex justify-between items-center mb-10">
             <div>
-              <h4 className="font-black text-slate-900 text-sm uppercase flex items-center gap-2"><BarChart3 size={16} className="text-blue-600" /> Category Stats</h4>
-              <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mt-1">Live Analytics</p>
+              <h4 className="font-black text-slate-900 text-sm uppercase flex items-center gap-2"><BarChart3 size={16} className="text-blue-600" /> Category Breakdown</h4>
+              <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mt-1">Live Statistics</p>
             </div>
             <span className="text-[10px] bg-slate-50 border px-3 py-1 rounded-full font-bold text-slate-400 uppercase">Live</span>
           </div>
@@ -960,27 +996,26 @@ const DashboardView = ({ lowStockItems, totalSales, grossProfit, transactions, p
                 </div>
               </div>
             ))}
-            {categorySales.length === 0 && <p className="text-center py-20 text-slate-300 italic text-sm">Waiting for transactions...</p>}
+            {categorySales.length === 0 && <p className="text-center py-20 text-slate-300 italic text-sm">No sales data found.</p>}
           </div>
         </div>
 
         <div className="xl:col-span-1 space-y-6">
           <div className="bg-white p-8 rounded-[2rem] border border-slate-100 shadow-sm">
-             <h4 className="font-black text-slate-900 text-sm uppercase mb-6 flex items-center gap-2"><Rocket size={16} className="text-blue-600" /> Actions</h4>
+             <h4 className="font-black text-slate-900 text-sm uppercase mb-6 flex items-center gap-2"><Rocket size={16} className="text-blue-600" /> Quick Tasks</h4>
              <div className="space-y-3">
-                {isTabAccessible('pos') && <ActionButton icon={<ShoppingCart size={18}/>} label="New Sale" onClick={() => onNavigate('pos')} color="blue" />}
-                {isTabAccessible('restock') && <ActionButton icon={<PackagePlus size={18}/>} label="Restock Goods" onClick={() => onNavigate('restock')} color="blue" />}
-                {isTabAccessible('inventory') && <ActionButton icon={<Boxes size={18}/>} label="Products" onClick={() => onNavigate('inventory')} color="slate" />}
-                {!isTabAccessible('pos') && !isTabAccessible('restock') && !isTabAccessible('inventory') && <p className="text-xs text-slate-400 italic py-4 text-center">No actions authorized.</p>}
+                {isTabAccessible('pos') && <ActionButton icon={<ShoppingCart size={18}/>} label="Create Sale" onClick={() => onNavigate('pos')} color="blue" />}
+                {isTabAccessible('restock') && <ActionButton icon={<PackagePlus size={18}/>} label="Restock Inventory" onClick={() => onNavigate('restock')} color="blue" />}
+                {isTabAccessible('inventory') && <ActionButton icon={<Boxes size={18}/>} label="Master Catalog" onClick={() => onNavigate('inventory')} color="slate" />}
              </div>
           </div>
           <div className="bg-slate-900 p-8 rounded-[2rem] border border-slate-800 shadow-xl text-white">
-            <h4 className="text-[10px] font-black uppercase tracking-widest text-slate-500 mb-4">Stock Health</h4>
+            <h4 className="text-[10px] font-black uppercase tracking-widest text-slate-500 mb-4">Inventory Health</h4>
             <div className="flex items-end gap-3 mb-2">
                <h2 className="text-4xl font-black">{products.length}</h2>
-               <span className="text-[10px] font-bold text-slate-500 mb-1.5 uppercase">Products</span>
+               <span className="text-[10px] font-bold text-slate-500 mb-1.5 uppercase">Items Active</span>
             </div>
-            <p className="text-xs text-slate-400 leading-relaxed font-medium">Monitoring inventory health based on minimum stock rules.</p>
+            <p className="text-xs text-slate-400 leading-relaxed font-medium">Automatic cloud-sync checks enabled for real-time tracking.</p>
           </div>
         </div>
       </div>
@@ -1015,7 +1050,7 @@ const POSView = ({ products, onSale, user }: any) => {
     <div className="max-w-4xl mx-auto grid grid-cols-1 lg:grid-cols-3 gap-8">
       <div className="lg:col-span-2 bg-white p-8 rounded-[2rem] shadow-sm border border-slate-200">
         <h3 className="text-xl font-black mb-8 text-slate-900 flex items-center gap-3">
-          <div className="p-2 bg-blue-600 text-white rounded-xl"><ShoppingCart size={20}/></div> Record Sale
+          <div className="p-2 bg-blue-600 text-white rounded-xl"><ShoppingCart size={20}/></div> New Transaction
         </h3>
         <form className="space-y-6" onSubmit={handleSubmit}>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-5">
@@ -1025,13 +1060,13 @@ const POSView = ({ products, onSale, user }: any) => {
                 const p = products.find((prod: any) => String(prod.id).trim().toLowerCase() === String(e.target.value).trim().toLowerCase());
                 setFormData({...formData, id: e.target.value, unitPrice: p ? p.sellingPrice : ''});
               }}>
-                <option value="">Search goods...</option>
+                <option value="">Find goods...</option>
                 {products.filter((p: any) => p.status === 'Active').map((p: any) => <option key={p.id} value={p.id}>{p.name} (Stock: {p.currentStock})</option>)}
               </select>
             </div>
             <div>
-              <label className="block text-[10px] font-black text-slate-400 uppercase mb-2 tracking-widest">Quantity</label>
-              <input type="number" min="1" className="w-full p-4 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-blue-100 font-bold" value={formData.qty} onChange={e => setFormData({...formData, qty: e.target.value})} placeholder="Qty" />
+              <label className="block text-[10px] font-black text-slate-400 uppercase mb-2 tracking-widest">Qty</label>
+              <input type="number" min="1" className="w-full p-4 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-blue-100 font-bold" value={formData.qty} onChange={e => setFormData({...formData, qty: e.target.value})} placeholder="0" />
             </div>
             <div>
               <label className="block text-[10px] font-black text-slate-400 uppercase mb-2 tracking-widest">Rate (Nu.)</label>
@@ -1040,30 +1075,28 @@ const POSView = ({ products, onSale, user }: any) => {
             <div className="sm:col-span-2">
                <label className="block text-[10px] font-black text-slate-400 uppercase mb-2 tracking-widest">Payment Method</label>
                <div className="flex gap-3">
-                  <button type="button" onClick={() => setFormData({...formData, method: 'Cash'})} className={`flex-1 flex items-center justify-center gap-2 p-4 rounded-2xl border font-bold transition-all ${formData.method === 'Cash' ? 'bg-slate-900 text-white border-slate-900 shadow-lg' : 'bg-slate-50 text-slate-400 border-slate-200'}`}>
+                  <button type="button" onClick={() => setFormData({...formData, method: 'Cash'})} className={`flex-1 flex items-center justify-center gap-2 p-4 rounded-2xl border font-bold transition-all ${formData.method === 'Cash' ? 'bg-slate-900 text-white border-slate-900' : 'bg-slate-50 text-slate-400 border-slate-200'}`}>
                     <Banknote size={18} /> Cash
                   </button>
-                  <button type="button" onClick={() => setFormData({...formData, method: 'QR/Transfer'})} className={`flex-1 flex items-center justify-center gap-2 p-4 rounded-2xl border font-bold transition-all ${formData.method === 'QR/Transfer' ? 'bg-slate-900 text-white border-slate-900 shadow-lg' : 'bg-slate-50 text-slate-400 border-slate-200'}`}>
+                  <button type="button" onClick={() => setFormData({...formData, method: 'QR/Transfer'})} className={`flex-1 flex items-center justify-center gap-2 p-4 rounded-2xl border font-bold transition-all ${formData.method === 'QR/Transfer' ? 'bg-slate-900 text-white border-slate-900' : 'bg-slate-50 text-slate-400 border-slate-200'}`}>
                     <QrCode size={18} /> QR/Transfer
                   </button>
                </div>
             </div>
           </div>
-          <button type="submit" className="w-full bg-blue-600 text-white font-black py-5 rounded-[1.5rem] shadow-xl hover:bg-blue-700 transition-all flex items-center justify-center gap-2">
-             <CheckCircle2 size={18} /> Complete Sale
-          </button>
+          <button type="submit" className="w-full bg-blue-600 text-white font-black py-5 rounded-[1.5rem] shadow-xl hover:bg-blue-700 transition-all">Submit Sale</button>
         </form>
       </div>
       <div className="bg-slate-900 text-white p-8 rounded-[2rem] flex flex-col justify-between shadow-2xl relative overflow-hidden">
         <div>
-           <h4 className="text-slate-500 text-[10px] font-black uppercase tracking-widest mb-6">Total Calculation</h4>
+           <h4 className="text-slate-500 text-[10px] font-black uppercase tracking-widest mb-6">Bill Summary</h4>
            <div className="space-y-4">
               <div className="flex justify-between border-b border-white/5 pb-3"><span>Subtotal</span><span className="font-bold">{formatCurrency(subtotal)}</span></div>
               <div className="flex justify-between border-b border-white/5 pb-3"><span className="text-blue-400">Tax (GST 5%)</span><span className="font-bold text-blue-400">+ {formatCurrency(gstAmount)}</span></div>
            </div>
         </div>
         <div className="pt-8">
-           <p className="text-slate-500 text-[10px] mb-1 font-black uppercase tracking-widest">Grand Total</p>
+           <p className="text-slate-500 text-[10px] mb-1 font-black uppercase tracking-widest">Final Amount</p>
            <h2 className="text-4xl font-black">{formatCurrency(grandTotal)}</h2>
         </div>
       </div>
@@ -1097,18 +1130,18 @@ const RestockView = ({ products, onRestock, user }: any) => {
             </select>
           </div>
           <div><label className="block text-[10px] font-black text-slate-400 uppercase mb-2 tracking-widest">Qty Received</label>
-          <input type="number" min="1" className="w-full p-4 bg-slate-50 border border-slate-200 rounded-2xl font-bold" value={formData.qty} onChange={e => setFormData({...formData, qty: e.target.value})} placeholder="Qty" /></div>
-          <div><label className="block text-[10px] font-black text-slate-400 uppercase mb-2 tracking-widest">Cost Price (Nu.)</label>
+          <input type="number" min="1" className="w-full p-4 bg-slate-50 border border-slate-200 rounded-2xl font-bold" value={formData.qty} onChange={e => setFormData({...formData, qty: e.target.value})} placeholder="0" /></div>
+          <div><label className="block text-[10px] font-black text-slate-400 uppercase mb-2 tracking-widest">Unit Cost (Nu.)</label>
           <input type="number" step="0.01" className="w-full p-4 bg-slate-50 border border-slate-200 rounded-2xl font-bold" value={formData.cost} onChange={e => setFormData({...formData, cost: e.target.value})} placeholder="0.00" /></div>
           <div>
-            <label className="block text-[10px] font-black text-slate-400 uppercase mb-2 tracking-widest">Bill/Invoice</label>
+            <label className="block text-[10px] font-black text-slate-400 uppercase mb-2 tracking-widest">Bill #</label>
             <div className="relative">
               <Hash className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} />
-              <input className="w-full pl-10 pr-3 py-4 bg-slate-50 border border-slate-200 rounded-2xl font-bold outline-none" placeholder="ID" value={formData.billNo} onChange={e => setFormData({...formData, billNo: e.target.value})} />
+              <input className="w-full pl-10 pr-3 py-4 bg-slate-50 border border-slate-200 rounded-2xl font-bold outline-none" placeholder="Invoice ID" value={formData.billNo} onChange={e => setFormData({...formData, billNo: e.target.value})} />
             </div>
           </div>
           <div>
-            <label className="block text-[10px] font-black text-slate-400 uppercase mb-2 tracking-widest">Supplier Name</label>
+            <label className="block text-[10px] font-black text-slate-400 uppercase mb-2 tracking-widest">Supplier</label>
             <div className="relative">
               <Truck className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} />
               <input className="w-full pl-10 pr-3 py-4 bg-slate-50 border border-slate-200 rounded-2xl font-bold outline-none" placeholder="Vendor" value={formData.supplier} onChange={e => setFormData({...formData, supplier: e.target.value})} />
@@ -1116,7 +1149,7 @@ const RestockView = ({ products, onRestock, user }: any) => {
           </div>
         </div>
         <button type="submit" className="w-full bg-blue-600 text-white font-black py-5 rounded-[1.5rem] shadow-xl hover:bg-blue-700 transition-all flex items-center justify-center gap-2">
-           <Save size={18} /> Update Inventory
+           <Save size={18} /> Post to Cloud
         </button>
       </form>
     </div>
@@ -1126,91 +1159,44 @@ const RestockView = ({ products, onRestock, user }: any) => {
 const InventoryView = ({ products, onAdd, onEdit }: any) => {
   const [isAdding, setIsAdding] = useState(false);
   const [editItem, setEditItem] = useState<any>(null);
-  const [originalId, setOriginalId] = useState<string | null>(null);
   const [formData, setFormData] = useState<any>({ id: '', name: '', category: 'General', unit: 'Pcs', costPrice: '', sellingPrice: '', currentStock: '', minStock: '5', supplier: '', status: 'Active' });
-  const [isNewCategory, setIsNewCategory] = useState(false);
-  const categories = useMemo(() => {
-    const set = new Set(products.map((p: any) => String(p.category || 'General').trim()).filter(Boolean));
-    if (set.size === 0) set.add('General');
-    return Array.from(set).sort();
-  }, [products]);
+  const categories = useMemo(() => Array.from(new Set(products.map((p: any) => String(p.category || 'General').trim()))).sort(), [products]);
 
   useEffect(() => {
-    if (editItem) { setFormData({...editItem}); setOriginalId(editItem.id); setIsNewCategory(false); }
-    else if (isAdding) { setFormData({ id: '', name: '', category: categories[0] || 'General', unit: 'Pcs', costPrice: '', sellingPrice: '', currentStock: '', minStock: '5', supplier: '', status: 'Active' }); setOriginalId(null); setIsNewCategory(false); }
-  }, [editItem, isAdding]); 
+    if (editItem) setFormData({...editItem});
+    else if (isAdding) setFormData({ id: '', name: '', category: categories[0] || 'General', unit: 'Pcs', costPrice: '', sellingPrice: '', currentStock: '', minStock: '5', supplier: '', status: 'Active' });
+  }, [editItem, isAdding, categories]); 
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    const finalData = { ...formData, id: String(formData.id).trim(), category: String(formData.category || 'General').trim(), costPrice: Number(formData.costPrice) || 0, sellingPrice: Number(formData.sellingPrice) || 0, currentStock: Number(formData.currentStock) || 0, minStock: Number(formData.minStock) || 0 };
-    if (editItem && originalId) { onEdit(finalData, originalId); setEditItem(null); }
-    else { onAdd(finalData); setIsAdding(false); }
+    if (editItem) onEdit({...formData}, editItem.id);
+    else onAdd({...formData});
+    setEditItem(null); setIsAdding(false);
   };
 
   return (
     <div className="space-y-6">
       <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
-        <h3 className="text-xl font-black text-slate-900 uppercase">Master Catalog</h3>
-        <button onClick={() => { setEditItem(null); setIsAdding(true); }} className="bg-slate-900 text-white px-8 py-3 rounded-2xl flex items-center gap-2 font-black shadow-lg text-xs uppercase tracking-widest hover:bg-black transition-all"><Plus size={18} /> New Product</button>
+        <h3 className="text-xl font-black text-slate-900 uppercase">Product Catalog</h3>
+        <button onClick={() => { setEditItem(null); setIsAdding(true); }} className="bg-slate-900 text-white px-8 py-3 rounded-2xl flex items-center gap-2 font-black shadow-lg text-xs uppercase tracking-widest hover:bg-black transition-all"><Plus size={18} /> Add Item</button>
       </div>
       {(isAdding || editItem) && (
-        <div className="bg-white p-10 rounded-[2rem] border border-slate-200 shadow-xl animate-in fade-in slide-in-from-top-4">
-          <div className="flex justify-between items-center mb-8">
-            <h4 className="font-black text-slate-900 text-lg flex items-center gap-2">
-              <Layers size={20} className="text-blue-600" /> {editItem ? 'Edit Profile' : 'Register Profile'}
-            </h4>
-            <button onClick={() => { setIsAdding(false); setEditItem(null); }} className="p-2 hover:bg-slate-100 rounded-full text-slate-400"><X size={20} /></button>
-          </div>
+        <div className="bg-white p-10 rounded-[2rem] border shadow-xl animate-in slide-in-from-top-4">
+          <div className="flex justify-between items-center mb-8"><h4 className="font-black text-slate-900 text-lg flex items-center gap-2"><Layers className="text-blue-600" /> {editItem ? 'Edit Profile' : 'New Profile'}</h4><button onClick={() => { setIsAdding(false); setEditItem(null); }} className="p-2 text-slate-400 hover:bg-slate-100 rounded-full"><X size={20} /></button></div>
           <form onSubmit={handleSubmit} className="space-y-6">
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5">
-              <div className="col-span-1">
-                <label className="block text-[10px] font-black text-slate-400 mb-1 uppercase">SKU/ID</label>
-                <input className="w-full p-3 bg-slate-50 border rounded-xl font-bold outline-none focus:border-blue-500" required value={formData.id} onChange={e => setFormData({...formData, id: e.target.value})} />
-              </div>
-              <div className="sm:col-span-1 lg:col-span-2">
-                <label className="block text-[10px] font-black text-slate-400 mb-1 uppercase">Name</label>
-                <input className="w-full p-3 bg-slate-50 border rounded-xl font-bold outline-none focus:border-blue-500" required value={formData.name} onChange={e => setFormData({...formData, name: e.target.value})} />
-              </div>
-              <div className="col-span-1">
-                <label className="block text-[10px] font-black text-slate-400 mb-1 uppercase">Category</label>
-                {!isNewCategory ? (
-                  <div className="flex items-center gap-2">
-                    <select className="w-full p-3 bg-slate-50 border rounded-xl font-bold outline-none flex-1" value={formData.category} onChange={e => setFormData({...formData, category: e.target.value})}>
-                      {categories.map(c => <option key={c} value={c}>{c}</option>)}
-                    </select>
-                    <button type="button" onClick={() => { setIsNewCategory(true); setFormData({...formData, category: ''}); }} className="p-3 bg-blue-50 text-blue-600 rounded-xl hover:bg-blue-100"><Plus size={18} /></button>
-                  </div>
-                ) : (
-                  <div className="flex items-center gap-2">
-                    <input autoFocus className="w-full p-3 bg-white border border-blue-200 rounded-xl font-bold outline-none" value={formData.category} onChange={e => setFormData({...formData, category: e.target.value})} />
-                    <button type="button" onClick={() => setIsNewCategory(false)} className="p-3 bg-slate-100 text-slate-400 rounded-xl"><X size={18} /></button>
-                  </div>
-                )}
-              </div>
-              <div className="col-span-1">
-                <label className="block text-[10px] font-black text-slate-400 mb-1 uppercase">Unit</label>
-                <input className="w-full p-3 bg-slate-50 border rounded-xl font-bold outline-none focus:border-blue-500" value={formData.unit} onChange={e => setFormData({...formData, unit: e.target.value})} />
-              </div>
-              <div className="col-span-1">
-                <label className="block text-[10px] font-black text-slate-400 mb-1 uppercase">Cost Price</label>
-                <input type="number" step="0.01" className="w-full p-3 bg-slate-50 border rounded-xl font-bold outline-none" value={formData.costPrice} onChange={e => setFormData({...formData, costPrice: e.target.value})} />
-              </div>
-              <div className="col-span-1">
-                <label className="block text-[10px] font-black text-slate-400 mb-1 uppercase">Selling Rate</label>
-                <input type="number" step="0.01" className="w-full p-3 bg-slate-50 border rounded-xl font-bold outline-none" value={formData.sellingPrice} onChange={e => setFormData({...formData, sellingPrice: e.target.value})} />
-              </div>
-              <div className="col-span-1">
-                <label className="block text-[10px] font-black text-slate-400 mb-1 uppercase tracking-widest">Stock</label>
-                <input type="number" className="w-full p-3 bg-slate-50 border rounded-xl font-bold outline-none" value={formData.currentStock} onChange={e => setFormData({...formData, currentStock: e.target.value})} />
-              </div>
-              <div className="col-span-1">
-                <label className="block text-[10px] font-black text-slate-400 mb-1 uppercase tracking-widest">Min Stock</label>
-                <input type="number" className="w-full p-3 bg-slate-50 border rounded-xl font-bold outline-none" value={formData.minStock} onChange={e => setFormData({...formData, minStock: e.target.value})} />
-              </div>
+              <div className="col-span-1"><label className="block text-[10px] font-black text-slate-400 mb-1 uppercase tracking-widest">SKU/ID</label><input className="w-full p-3 bg-slate-50 border rounded-xl font-bold outline-none focus:border-blue-500" required value={formData.id} onChange={e => setFormData({...formData, id: e.target.value})} /></div>
+              <div className="sm:col-span-1 lg:col-span-2"><label className="block text-[10px] font-black text-slate-400 mb-1 uppercase tracking-widest">Name</label><input className="w-full p-3 bg-slate-50 border rounded-xl font-bold outline-none focus:border-blue-500" required value={formData.name} onChange={e => setFormData({...formData, name: e.target.value})} /></div>
+              <div className="col-span-1"><label className="block text-[10px] font-black text-slate-400 mb-1 uppercase tracking-widest">Category</label><input className="w-full p-3 bg-slate-50 border rounded-xl font-bold outline-none" value={formData.category} onChange={e => setFormData({...formData, category: e.target.value})} /></div>
+              <div className="col-span-1"><label className="block text-[10px] font-black text-slate-400 mb-1 uppercase tracking-widest">Unit</label><input className="w-full p-3 bg-slate-50 border rounded-xl font-bold outline-none" value={formData.unit} onChange={e => setFormData({...formData, unit: e.target.value})} /></div>
+              <div className="col-span-1"><label className="block text-[10px] font-black text-slate-400 mb-1 uppercase tracking-widest">Cost (Nu.)</label><input type="number" className="w-full p-3 bg-slate-50 border rounded-xl font-bold outline-none" value={formData.costPrice} onChange={e => setFormData({...formData, costPrice: e.target.value})} /></div>
+              <div className="col-span-1"><label className="block text-[10px] font-black text-slate-400 mb-1 uppercase tracking-widest">Rate (Nu.)</label><input type="number" className="w-full p-3 bg-slate-50 border rounded-xl font-bold outline-none" value={formData.sellingPrice} onChange={e => setFormData({...formData, sellingPrice: e.target.value})} /></div>
+              <div className="col-span-1"><label className="block text-[10px] font-black text-slate-400 mb-1 uppercase tracking-widest">Stock</label><input type="number" className="w-full p-3 bg-slate-50 border rounded-xl font-bold outline-none" value={formData.currentStock} onChange={e => setFormData({...formData, currentStock: e.target.value})} /></div>
+              <div className="col-span-1"><label className="block text-[10px] font-black text-slate-400 mb-1 uppercase tracking-widest">Alert @</label><input type="number" className="w-full p-3 bg-slate-50 border rounded-xl font-bold outline-none" value={formData.minStock} onChange={e => setFormData({...formData, minStock: e.target.value})} /></div>
             </div>
             <div className="pt-8 border-t flex justify-end gap-3">
-               <button type="button" onClick={() => { setIsAdding(false); setEditItem(null); }} className="px-8 py-3 text-slate-400 font-black uppercase text-xs tracking-widest">Discard</button>
-               <button type="submit" className="px-10 py-3 bg-blue-600 text-white font-black rounded-2xl shadow-xl uppercase text-xs tracking-widest hover:bg-blue-700 transition-all">Save Changes</button>
+               <button type="button" onClick={() => { setIsAdding(false); setEditItem(null); }} className="px-8 py-3 text-slate-400 font-black uppercase text-xs tracking-widest">Cancel</button>
+               <button type="submit" className="px-10 py-3 bg-blue-600 text-white font-black rounded-2xl shadow-xl uppercase text-xs tracking-widest hover:bg-blue-700 transition-all">Save Profile</button>
             </div>
           </form>
         </div>
@@ -1219,25 +1205,17 @@ const InventoryView = ({ products, onAdd, onEdit }: any) => {
         <div className="overflow-x-auto">
           <table className="w-full text-sm text-left whitespace-nowrap">
             <thead className="text-[10px] text-slate-400 font-black uppercase tracking-widest bg-slate-50">
-              <tr>
-                <th className="px-8 py-5">SKU</th><th className="px-8 py-5">Product</th><th className="px-8 py-5">Category</th><th className="px-8 py-5 text-right font-black">Price</th><th className="px-8 py-5 text-center">In Stock</th><th className="px-8 py-5 text-center">Actions</th>
-              </tr>
+              <tr><th className="px-8 py-5">SKU</th><th className="px-8 py-5">Item</th><th className="px-8 py-5">Category</th><th className="px-8 py-5 text-right font-black">Price</th><th className="px-8 py-5 text-center">Stock</th><th className="px-8 py-5 text-center">Action</th></tr>
             </thead>
             <tbody className="divide-y divide-slate-50">
               {products.map((p: Product) => (
                 <tr key={p.id} className="hover:bg-slate-50 transition-colors">
-                  <td className="px-8 py-5 font-mono text-[11px] text-slate-400 uppercase">{p.id}</td>
+                  <td className="px-8 py-5 font-mono text-[11px] text-slate-400">{p.id}</td>
                   <td className="px-8 py-5 font-black text-slate-900">{p.name}</td>
                   <td className="px-8 py-5 font-bold text-slate-500 text-[11px] uppercase">{p.category}</td>
                   <td className="px-8 py-5 text-right font-black text-slate-900">{formatCurrency(p.sellingPrice)}</td>
-                  <td className="px-8 py-5 text-center">
-                    <span className={`px-3 py-1 rounded-lg text-[10px] font-black uppercase ${p.currentStock <= p.minStock ? 'bg-red-50 text-red-600 border border-red-100' : 'bg-green-50 text-green-700'}`}>
-                      {p.currentStock} {p.unit}
-                    </span>
-                  </td>
-                  <td className="px-8 py-5 text-center">
-                    <button className="p-3 text-slate-400 hover:text-blue-600 hover:bg-white rounded-xl transition-all" onClick={() => setEditItem(p)}><Pencil size={16} /></button>
-                  </td>
+                  <td className="px-8 py-5 text-center"><span className={`px-3 py-1 rounded-lg text-[10px] font-black uppercase ${p.currentStock <= p.minStock ? 'bg-red-50 text-red-600 border border-red-100' : 'bg-green-50 text-green-700'}`}>{p.currentStock} {p.unit}</span></td>
+                  <td className="px-8 py-5 text-center"><button className="p-3 text-slate-400 hover:text-blue-600 rounded-xl transition-all" onClick={() => setEditItem(p)}><Pencil size={16} /></button></td>
                 </tr>
               ))}
             </tbody>
@@ -1279,39 +1257,28 @@ const ReportsView = ({ transactions }: { transactions: Transaction[] }) => {
   }, [transactions]);
 
   const handleExportSummary = () => {
-    const exportData = reportData.map((r: any) => ({ 'Period': r.period, 'Revenue': r.sales, 'Expenses': r.expense, 'GST Taxes': r.tax, 'Net Profit': r.net }));
-    downloadCSV(exportData, `Analytics_${period}`, ['Period', 'Revenue', 'Expenses', 'GST Taxes', 'Net Profit']);
+    const exportData = reportData.map((r: any) => ({ 'Period': r.period, 'Revenue': r.sales, 'Expenses': r.expense, 'Tax': r.tax, 'Net Profit': r.net }));
+    downloadCSV(exportData, `Analytics_${period}`, ['Period', 'Revenue', 'Expenses', 'Tax', 'Net Profit']);
   };
 
   const handleExportHistory = () => {
-    downloadCSV(salesHistory, 'Sales_Journal', ['Date', 'Item', 'Qty', 'Rate', 'GST(5%)', 'Total', 'User', 'Method']);
+    downloadCSV(salesHistory, 'Sales_Journal', ['Date', 'Item', 'Qty', 'Rate', 'Tax', 'Total', 'User', 'Method']);
   };
 
   return (
     <div className="space-y-12 animate-in slide-in-from-bottom-4 duration-500 pb-20">
       <div className="space-y-6">
         <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
-          <div className="flex items-center gap-3">
-             <div className="p-2 bg-blue-600 text-white rounded-xl"><Calculator size={22} /></div>
-             <div>
-               <h3 className="text-xl font-black text-slate-900 uppercase">Financial Audit</h3>
-               <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">Business Summary</p>
-             </div>
-          </div>
-          <div className="flex gap-2 w-full sm:w-auto">
-            <div className="flex bg-slate-200/50 p-1 rounded-2xl flex-1 sm:flex-initial">
-              {['daily', 'monthly', 'yearly'].map(p => (
-                <button key={p} onClick={() => setPeriod(p as any)} className={`flex-1 px-5 py-2 rounded-xl text-[10px] font-black uppercase transition-all ${period === p ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500'}`}>{p}</button>
-              ))}
-            </div>
-            <button onClick={handleExportSummary} className="p-2 bg-slate-900 text-white rounded-xl hover:bg-black shadow-md"><FileDown size={20} /></button>
-          </div>
+          <div className="flex items-center gap-3"><div className="p-2 bg-blue-600 text-white rounded-xl"><Calculator size={22} /></div><div><h3 className="text-xl font-black text-slate-900 uppercase">Financial Metrics</h3><p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">Business Audit</p></div></div>
+          <div className="flex gap-2 w-full sm:w-auto"><div className="flex bg-slate-200/50 p-1 rounded-2xl flex-1 sm:flex-initial">
+              {['daily', 'monthly', 'yearly'].map(p => (<button key={p} onClick={() => setPeriod(p as any)} className={`flex-1 px-5 py-2 rounded-xl text-[10px] font-black uppercase transition-all ${period === p ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500'}`}>{p}</button>))}
+            </div><button onClick={handleExportSummary} className="p-2 bg-slate-900 text-white rounded-xl hover:bg-black shadow-md"><FileDown size={20} /></button></div>
         </div>
         <div className="bg-white rounded-[2rem] border overflow-hidden shadow-sm">
           <div className="overflow-x-auto">
             <table className="w-full text-sm text-left">
               <thead className="text-[10px] text-slate-400 font-black uppercase tracking-widest bg-slate-50">
-                <tr><th className="px-8 py-5">Period</th><th className="px-8 py-5 text-right">Revenue</th><th className="px-8 py-5 text-right text-blue-500">GST (5%)</th><th className="px-8 py-5 text-right text-red-500">Expenses</th><th className="px-8 py-5 text-right font-black">Profit</th></tr>
+                <tr><th className="px-8 py-5">Period</th><th className="px-8 py-5 text-right">Revenue</th><th className="px-8 py-5 text-right text-blue-500">GST (5%)</th><th className="px-8 py-5 text-right text-red-500">Purchase Cost</th><th className="px-8 py-5 text-right font-black">Net Profit</th></tr>
               </thead>
               <tbody className="divide-y divide-slate-50">
                 {reportData.map((r: any, idx: number) => (
@@ -1330,19 +1297,14 @@ const ReportsView = ({ transactions }: { transactions: Transaction[] }) => {
       </div>
       <div className="space-y-6">
         <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
-           <div className="flex items-center gap-3">
-              <div className="p-2 bg-blue-600 text-white rounded-xl"><History size={22} /></div>
-              <div><h3 className="text-xl font-black text-slate-900 uppercase">Sales Journal</h3><p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">Transaction History</p></div>
-           </div>
-           <button onClick={handleExportHistory} className="flex items-center gap-2 px-6 py-2 bg-slate-900 text-white text-[10px] font-black uppercase rounded-xl hover:bg-black shadow-lg transition-all">
-              <FileDown size={14} /> Export Journal
-           </button>
+           <div className="flex items-center gap-3"><div className="p-2 bg-blue-600 text-white rounded-xl"><History size={22} /></div><div><h3 className="text-xl font-black text-slate-900 uppercase">Sales Journal</h3><p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">Full History</p></div></div>
+           <button onClick={handleExportHistory} className="flex items-center gap-2 px-6 py-2 bg-slate-900 text-white text-[10px] font-black uppercase tracking-widest rounded-xl hover:bg-black shadow-lg transition-all"><FileDown size={14} /> Export Journal</button>
         </div>
         <div className="bg-white rounded-[2rem] border overflow-hidden shadow-sm">
           <div className="overflow-x-auto">
             <table className="w-full text-sm text-left whitespace-nowrap">
               <thead className="text-[10px] text-slate-400 font-black uppercase tracking-widest bg-slate-50">
-                <tr><th className="px-8 py-5">Time</th><th className="px-8 py-5">Product</th><th className="px-8 py-5 text-center">Qty</th><th className="px-8 py-5 text-right">Rate</th><th className="px-8 py-5 text-right text-blue-500">GST</th><th className="px-8 py-5 text-right font-black">Total</th><th className="px-8 py-5">Method</th><th className="px-8 py-5">Staff</th></tr>
+                <tr><th className="px-8 py-5">Time</th><th className="px-8 py-5">Product</th><th className="px-8 py-5 text-center">Qty</th><th className="px-8 py-5 text-right">Rate</th><th className="px-8 py-5 text-right text-blue-500">Tax</th><th className="px-8 py-5 text-right font-black">Total</th><th className="px-8 py-5">Mode</th><th className="px-8 py-5">By</th></tr>
               </thead>
               <tbody className="divide-y divide-slate-50">
                 {salesHistory.map((s, idx) => (
@@ -1369,36 +1331,28 @@ const ReportsView = ({ transactions }: { transactions: Transaction[] }) => {
 const AccessControlView = ({ permissions, onUpdatePermissions, onShowToast }: any) => {
   const handleTogglePermission = (key: keyof StaffPermissions) => {
     onUpdatePermissions({ ...permissions, [key]: !permissions[key] });
-    onShowToast(`Cloud settings updated.`);
+    onShowToast(`Permissions updated.`);
   };
 
   return (
     <div className="max-w-xl mx-auto space-y-8 animate-in fade-in slide-in-from-top-4">
       <div className="bg-white p-10 rounded-[2.5rem] border shadow-sm">
-        <h3 className="text-xl font-black mb-6 flex items-center gap-3"><ShieldCheck className="text-blue-600" /> Remote Access Policy</h3>
-        <p className="text-sm text-slate-500 mb-8 leading-relaxed">Modify module access for <strong>'Service Staff' (staff123)</strong>. Changes are pushed to cloud storage instantly.</p>
+        <h3 className="text-xl font-black mb-6 flex items-center gap-3"><ShieldCheck className="text-blue-600" /> Staff Access Policy</h3>
+        <p className="text-sm text-slate-500 mb-8 leading-relaxed">Toggle module visibility for <strong>'Service Staff' (staff123)</strong>. Changes are pushed to cloud storage instantly.</p>
         <div className="space-y-4">
           {Object.keys(permissions).map((module) => (
             <div key={module} className="flex items-center justify-between p-5 border rounded-2xl hover:bg-slate-50 transition-all">
               <div><span className="text-sm font-black text-slate-700 capitalize">{module} Module</span><p className="text-[10px] text-slate-400 font-bold uppercase mt-1">Permission Active</p></div>
-              <button onClick={() => handleTogglePermission(module as keyof StaffPermissions)} className={`relative inline-flex h-8 w-14 items-center rounded-full transition-colors ${permissions[module] ? 'bg-blue-600' : 'bg-slate-200'}`}>
-                <span className={`inline-block h-6 w-6 transform rounded-full bg-white transition-transform shadow-md ${permissions[module] ? 'translate-x-7' : 'translate-x-1'}`} />
-              </button>
+              <button onClick={() => handleTogglePermission(module as keyof StaffPermissions)} className={`relative inline-flex h-8 w-14 items-center rounded-full transition-colors ${permissions[module] ? 'bg-blue-600' : 'bg-slate-200'}`}><span className={`inline-block h-6 w-6 transform rounded-full bg-white transition-transform shadow-md ${permissions[module] ? 'translate-x-7' : 'translate-x-1'}`} /></button>
             </div>
           ))}
         </div>
       </div>
       <div className="bg-slate-900 p-8 rounded-[2rem] text-white">
-         <h4 className="text-[10px] font-black uppercase tracking-widest text-slate-500 mb-4">Hardcoded User Policy</h4>
+         <h4 className="text-[10px] font-black uppercase tracking-widest text-slate-500 mb-4">Auth Policy</h4>
          <div className="space-y-4">
-            <div className="flex items-center gap-4">
-               <div className="w-10 h-10 bg-blue-600 rounded-xl flex items-center justify-center font-black">A</div>
-               <div><p className="text-sm font-bold">Admin (admin / admin123)</p><p className="text-[10px] text-blue-400 uppercase font-bold">Full Owner</p></div>
-            </div>
-            <div className="flex items-center gap-4">
-               <div className="w-10 h-10 bg-slate-700 rounded-xl flex items-center justify-center font-black">S</div>
-               <div><p className="text-sm font-bold">Staff (staff / staff123)</p><p className="text-[10px] text-slate-500 uppercase font-bold">Limited Role</p></div>
-            </div>
+            <div className="flex items-center gap-4"><div className="w-10 h-10 bg-blue-600 rounded-xl flex items-center justify-center font-black">A</div><div><p className="text-sm font-bold">Admin (admin / admin123)</p><p className="text-[10px] text-blue-400 uppercase font-bold">Full Access</p></div></div>
+            <div className="flex items-center gap-4"><div className="w-10 h-10 bg-slate-700 rounded-xl flex items-center justify-center font-black">S</div><div><p className="text-sm font-bold">Staff (staff / staff123)</p><p className="text-[10px] text-slate-500 uppercase font-bold">Limited Role</p></div></div>
          </div>
       </div>
     </div>
@@ -1409,10 +1363,7 @@ const LowStockModal = ({ items, onClose }: { items: Product[], onClose: () => vo
   <div className="fixed inset-0 bg-slate-900/60 z-[300] backdrop-blur-sm flex items-center justify-center p-4">
     <div className="bg-white w-full max-w-2xl rounded-[2.5rem] shadow-2xl overflow-hidden animate-in zoom-in-95 duration-300 border">
       <div className="px-10 py-8 border-b flex justify-between items-center bg-slate-50">
-        <div className="flex items-center gap-4">
-          <div className="w-12 h-12 bg-red-100 text-red-600 rounded-2xl flex items-center justify-center"><AlertTriangle size={28} /></div>
-          <div><h3 className="text-xl font-black text-slate-900">Low Stock Alert</h3><p className="text-[10px] text-slate-400 font-black uppercase tracking-widest">Action Required</p></div>
-        </div>
+        <div className="flex items-center gap-4"><div className="w-12 h-12 bg-red-100 text-red-600 rounded-2xl flex items-center justify-center"><AlertTriangle size={28} /></div><div><h3 className="text-xl font-black text-slate-900">Critical Alerts</h3><p className="text-[10px] text-slate-400 font-black uppercase tracking-widest">Levels Below Safety Threshold</p></div></div>
         <button onClick={onClose} className="p-3 hover:bg-slate-200 rounded-full"><X size={24} /></button>
       </div>
       <div className="p-0 max-h-[50vh] overflow-y-auto">
@@ -1424,19 +1375,22 @@ const LowStockModal = ({ items, onClose }: { items: Product[], onClose: () => vo
             {items.map(item => (
               <tr key={item.id} className="hover:bg-red-50/20">
                 <td className="px-10 py-5"><p className="font-black mb-1">{item.name}</p><p className="text-[10px] text-slate-400 font-mono">{item.id}</p></td>
-                <td className="px-10 py-5 text-center"><span className="px-3 py-1 rounded-lg bg-red-50 text-red-600 font-black text-[10px]">{item.currentStock} {item.unit}</span></td>
-                <td className="px-10 py-5 text-right font-black text-red-600 uppercase text-[10px]">Restock Now</td>
+                <td className="px-10 py-5 text-center"><span className="px-3 py-1 rounded-lg bg-red-50 text-red-600 font-black text-[10px]">{item.currentStock} {item.unit} left</span></td>
+                <td className="px-10 py-5 text-right font-black text-red-600 uppercase text-[10px]">Restock Soon</td>
               </tr>
             ))}
           </tbody>
         </table>
       </div>
       <div className="p-10 bg-slate-50 border-t flex justify-end">
-        <button onClick={onClose} className="px-12 py-4 bg-slate-900 text-white font-black rounded-2xl uppercase tracking-widest text-xs shadow-xl transition-all hover:bg-black">Dismiss</button>
+        <button onClick={onClose} className="px-12 py-4 bg-slate-900 text-white font-black rounded-2xl uppercase tracking-widest text-xs hover:bg-black shadow-xl transition-all">Dismiss</button>
       </div>
     </div>
   </div>
 );
+
+// --- Entry Point ---
+// Re-using the previously defined constants from lines 142-144
 
 const root = createRoot(document.getElementById('root')!);
 root.render(<App />);
