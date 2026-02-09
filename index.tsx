@@ -655,6 +655,8 @@ const NavButton = ({ active, onClick, icon, label, restricted }: any) => (
 const POSView = ({ products, onBulkSale, user }: any) => {
   const [cart, setCart] = useState<CartItem[]>([]);
   const [formData, setFormData] = useState({ productId: '', qty: '', unitPrice: '', method: 'Cash' });
+  const [productQuery, setProductQuery] = useState('');
+  const [showSuggestions, setShowSuggestions] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
 
   const selectedProduct = useMemo(() => products.find((p: any) => p.id === formData.productId), [formData.productId, products]);
@@ -706,22 +708,38 @@ const POSView = ({ products, onBulkSale, user }: any) => {
               <Plus className="text-blue-600" size={20} /> Item Selection
             </h3>
             <form onSubmit={handleAddToCart} className="space-y-4 sm:space-y-5">
-              <div>
+              <div className="relative">
                 <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Product</label>
-                <select 
+                <input
+                  type="text"
                   className="w-full p-3 sm:p-4 bg-slate-50 border border-slate-200 rounded-xl sm:rounded-2xl font-bold outline-none focus:ring-4 focus:ring-blue-100 transition-all text-sm"
-                  required
-                  value={formData.productId}
+                  placeholder="Type product name..."
+                  value={productQuery || (formData.productId ? products.find((p:any)=>p.id===formData.productId)?.name || '' : '')}
                   onChange={e => {
-                    const p = products.find((prod: any) => prod.id === e.target.value);
-                    setFormData({ ...formData, productId: e.target.value, unitPrice: p?.sellingPrice || '' });
+                    setProductQuery(e.target.value);
+                    setShowSuggestions(true);
+                    // clear productId when typing
+                    if (formData.productId) setFormData({ ...formData, productId: '', unitPrice: '' });
                   }}
-                >
-                  <option value="">Select Goods...</option>
-                  {products.filter((p: any) => p.status === 'Active' && p.currentStock > 0).map((p: any) => (
-                    <option key={p.id} value={p.id}>{p.name} (Stk: {p.currentStock})</option>
-                  ))}
-                </select>
+                  onFocus={() => setShowSuggestions(true)}
+                  required
+                />
+                {showSuggestions && (
+                  <div className="absolute z-30 left-0 right-0 mt-1 bg-white border rounded-lg shadow-lg max-h-60 overflow-auto">
+                    {products.filter((p: any) => p.status === 'Active' && p.currentStock > 0 && p.name.toLowerCase().includes((productQuery || '').toLowerCase())).slice(0, 20).map((p: any) => (
+                      <div key={p.id} className="px-3 py-2 hover:bg-slate-50 cursor-pointer" onMouseDown={(ev) => { ev.preventDefault(); setFormData({ ...formData, productId: p.id, unitPrice: p.sellingPrice }); setProductQuery(p.name); setShowSuggestions(false); }}>
+                        <div className="flex justify-between items-center">
+                          <div className="font-bold text-sm">{p.name}</div>
+                          <div className="text-[11px] text-slate-500">Stk: {p.currentStock}</div>
+                        </div>
+                        <div className="text-[12px] text-slate-400">{formatCurrency(p.sellingPrice)}</div>
+                      </div>
+                    ))}
+                    {products.filter((p: any) => p.status === 'Active' && p.currentStock > 0 && p.name.toLowerCase().includes((productQuery || '').toLowerCase())).length === 0 && (
+                      <div className="px-3 py-2 text-slate-400 text-sm">No matching products</div>
+                    )}
+                  </div>
+                )}
               </div>
 
               <div className="grid grid-cols-2 gap-3 sm:gap-4">
@@ -849,6 +867,32 @@ const POSView = ({ products, onBulkSale, user }: any) => {
   );
 };
 
+const RestockTypeahead = ({ products, formData, setFormData }: any) => {
+  const [query, setQuery] = useState('');
+  const [showSuggestions, setShowSuggestions] = useState(false);
+
+  const displayValue = query || (formData.id ? products.find((p: any) => p.id === formData.id)?.name || '' : '');
+
+  return (
+    <div className="relative">
+      <input type="text" value={displayValue} onChange={e => { setQuery(e.target.value); setShowSuggestions(true); if (formData.id) setFormData({ ...formData, id: '', cost: '', supplier: '' }); }} onFocus={() => setShowSuggestions(true)} placeholder="Type product name or SKU..." className="w-full p-3 sm:p-4 bg-slate-50 border border-slate-200 rounded-xl sm:rounded-2xl font-bold outline-none text-sm" required />
+      {showSuggestions && (
+        <div className="absolute z-30 left-0 right-0 mt-1 bg-white border rounded-lg shadow-lg max-h-60 overflow-auto">
+          {products.filter((p: any) => (query === '' || p.name.toLowerCase().includes(query.toLowerCase()) || p.id.toLowerCase().includes(query.toLowerCase()))).slice(0, 30).map((p: any) => (
+            <div key={p.id} className="px-3 py-2 hover:bg-slate-50 cursor-pointer" onMouseDown={(ev) => { ev.preventDefault(); setFormData({ ...formData, id: p.id, cost: p.costPrice || '', supplier: p.supplier || '' }); setQuery(p.name); setShowSuggestions(false); }}>
+              <div className="flex justify-between items-center"><div className="font-bold text-sm">{p.name}</div><div className="text-[11px] text-slate-500">{p.id}</div></div>
+              <div className="text-[12px] text-slate-400">{formatCurrency(p.costPrice)}</div>
+            </div>
+          ))}
+          {products.filter((p: any) => (query === '' || p.name.toLowerCase().includes(query.toLowerCase()) || p.id.toLowerCase().includes(query.toLowerCase()))).length === 0 && (
+            <div className="px-3 py-2 text-slate-400 text-sm">No matching products</div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
 const DashboardView = ({ lowStockItems, totalSales, grossProfit, transactions, products, onAlertClick, onNavigate, isTabAccessible, currentUser }: any) => {
   const isOwner = currentUser?.role === 'Owner';
   const categorySales = useMemo(() => {
@@ -941,15 +985,10 @@ const RestockView = ({ products, onRestock, user }: any) => {
       <h3 className="text-lg sm:text-xl font-black mb-6 sm:mb-8 flex items-center gap-3"><div className="p-2 bg-blue-600 text-white rounded-xl"><PackagePlus size={22} /></div> Inbound Goods</h3>
       <form className="space-y-4 sm:space-y-6" onSubmit={handleSubmit}>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 sm:gap-5">
-          <div className="sm:col-span-2"><label className="block text-[10px] font-black text-slate-400 uppercase mb-2 tracking-widest">Select SKU</label>
-            <select className="w-full p-3 sm:p-4 bg-slate-50 border border-slate-200 rounded-xl sm:rounded-2xl font-bold outline-none text-sm" required value={formData.id} onChange={e => {
-              const p = products.find((prod: any) => prod.id === e.target.value);
-              setFormData({...formData, id: e.target.value, cost: p?.costPrice || '', supplier: p?.supplier || ''});
-            }}>
-               <option value="">Find goods...</option>
-               {products.map((p: any) => <option key={p.id} value={p.id}>{p.name} ({p.id})</option>)}
-            </select>
-          </div>
+          <div className="sm:col-span-2">
+              <label className="block text-[10px] font-black text-slate-400 uppercase mb-2 tracking-widest">Select SKU</label>
+              <RestockTypeahead products={products} formData={formData} setFormData={setFormData} />
+            </div>
           <div><label className="block text-[10px] font-black text-slate-400 uppercase mb-2 tracking-widest">Quantity</label><input type="number" min="1" className="w-full p-3 sm:p-4 bg-slate-50 border rounded-xl sm:rounded-2xl font-bold outline-none text-sm" value={formData.qty} onChange={e => setFormData({...formData, qty: e.target.value})} placeholder="0" /></div>
           <div><label className="block text-[10px] font-black text-slate-400 uppercase mb-2 tracking-widest">Unit Cost</label><input type="number" step="0.01" className="w-full p-3 sm:p-4 bg-slate-50 border rounded-xl sm:rounded-2xl font-bold outline-none text-sm" value={formData.cost} onChange={e => setFormData({...formData, cost: e.target.value})} placeholder="0.00" /></div>
           <div className="sm:col-span-2 grid grid-cols-2 gap-3 sm:gap-4">
@@ -969,10 +1008,28 @@ const InventoryView = ({ products, onAdd, onEdit }: any) => {
   const [formData, setFormData] = useState<any>({ id: '', name: '', category: 'General', unit: 'Pcs', costPrice: '', sellingPrice: '', currentStock: '', minStock: '5', supplier: '', status: 'Active' });
   const categories = useMemo(() => Array.from(new Set(products.map((p: any) => String(p.category || 'General').trim()))).sort(), [products]);
 
+  const [showNewCategory, setShowNewCategory] = useState(false);
+  const [newCategory, setNewCategory] = useState('');
+  const [localCategories, setLocalCategories] = useState<string[]>(categories);
+
+  // Keep localCategories in sync with upstream categories but preserve any user-added ones
   useEffect(() => {
-    if (editItem) setFormData({...editItem});
-    else if (isAdding) setFormData({ id: '', name: '', category: categories[0] || 'General', unit: 'Pcs', costPrice: '', sellingPrice: '', currentStock: '', minStock: '5', supplier: '', status: 'Active' });
-  }, [editItem, isAdding, categories]); 
+    setLocalCategories(prev => Array.from(new Set([...prev, ...categories])));
+  }, [categories]);
+
+  // Set form when editing
+  useEffect(() => {
+    if (editItem) setFormData({ ...editItem });
+  }, [editItem]);
+
+  // Initialize form when starting to add. Do NOT reset when categories change to avoid clearing user input.
+  useEffect(() => {
+    if (isAdding) {
+      setFormData({ id: '', name: '', category: categories[0] || 'General', unit: 'Pcs', costPrice: '', sellingPrice: '', currentStock: '', minStock: '5', supplier: '', status: 'Active' });
+      setShowNewCategory(false);
+      setNewCategory('');
+    }
+  }, [isAdding]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -994,7 +1051,23 @@ const InventoryView = ({ products, onAdd, onEdit }: any) => {
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 sm:gap-5">
               <div className="col-span-1"><label className="block text-[10px] font-black text-slate-400 mb-1 uppercase tracking-widest">SKU/ID</label><input className="w-full p-3 bg-slate-50 border rounded-xl font-bold outline-none" required value={formData.id} onChange={e => setFormData({...formData, id: e.target.value})} /></div>
               <div className="sm:col-span-1 lg:col-span-2"><label className="block text-[10px] font-black text-slate-400 mb-1 uppercase tracking-widest">Name</label><input className="w-full p-3 bg-slate-50 border rounded-xl font-bold outline-none" required value={formData.name} onChange={e => setFormData({...formData, name: e.target.value})} /></div>
-              <div className="col-span-1"><label className="block text-[10px] font-black text-slate-400 mb-1 uppercase tracking-widest">Category</label><input className="w-full p-3 bg-slate-50 border rounded-xl font-bold outline-none" value={formData.category} onChange={e => setFormData({...formData, category: e.target.value})} /></div>
+              <div className="col-span-1">
+                <label className="block text-[10px] font-black text-slate-400 mb-1 uppercase tracking-widest">Category</label>
+                {!showNewCategory ? (
+                  <select className="w-full p-3 bg-slate-50 border rounded-xl font-bold outline-none text-sm" value={formData.category} onChange={e => {
+                    if (e.target.value === '__add_new__') { setShowNewCategory(true); setFormData({...formData, category: ''}); }
+                    else setFormData({...formData, category: e.target.value});
+                  }}>
+                    {localCategories.map((c: string) => <option key={c} value={c}>{c}</option>)}
+                    <option value="__add_new__">+ Add new category...</option>
+                  </select>
+                ) : (
+                  <div className="flex gap-2">
+                    <input className="w-full p-3 bg-slate-50 border rounded-xl font-bold outline-none text-sm" placeholder="New category" value={newCategory} onChange={e => setNewCategory(e.target.value)} />
+                    <button type="button" onClick={() => { const v = newCategory.trim(); if (v) { setFormData({...formData, category: v}); setShowNewCategory(false); setNewCategory(''); setLocalCategories(prev => Array.from(new Set([v, ...prev]))); } }} className="px-3 py-2 bg-blue-600 text-white rounded-xl font-black text-sm">Add</button>
+                  </div>
+                )}
+              </div>
               <div className="col-span-1"><label className="block text-[10px] font-black text-slate-400 mb-1 uppercase tracking-widest">Unit</label><input className="w-full p-3 bg-slate-50 border rounded-xl font-bold outline-none" value={formData.unit} onChange={e => setFormData({...formData, unit: e.target.value})} /></div>
               <div className="col-span-1"><label className="block text-[10px] font-black text-slate-400 mb-1 uppercase tracking-widest">Purchase Nu.</label><input type="number" className="w-full p-3 bg-slate-50 border rounded-xl font-bold outline-none" value={formData.costPrice} onChange={e => setFormData({...formData, costPrice: e.target.value})} /></div>
               <div className="col-span-1"><label className="block text-[10px] font-black text-slate-400 mb-1 uppercase tracking-widest">Retail Nu.</label><input type="number" className="w-full p-3 bg-slate-50 border rounded-xl font-bold outline-none" value={formData.sellingPrice} onChange={e => setFormData({...formData, sellingPrice: e.target.value})} /></div>
@@ -1033,6 +1106,10 @@ const InventoryView = ({ products, onAdd, onEdit }: any) => {
 
 const ReportsView = ({ transactions }: { transactions: Transaction[] }) => {
   const [period, setPeriod] = useState<'daily' | 'monthly' | 'yearly'>('daily');
+  // Date filters for Transaction Audit
+  const todayISO = new Date().toISOString().split('T')[0];
+  const [fromDate, setFromDate] = useState<string>(todayISO);
+  const [toDate, setToDate] = useState<string>(todayISO);
   const reportData = useMemo(() => {
     const grouped: any = {};
     transactions.forEach((t: Transaction) => {
@@ -1047,13 +1124,27 @@ const ReportsView = ({ transactions }: { transactions: Transaction[] }) => {
   }, [transactions, period]);
 
   const salesHistory = useMemo(() => {
-    return transactions.filter(t => t.type === 'SALE').map(t => ({
-        date: new Date(t.date).toLocaleString(), item: t.itemName, qty: t.qty, rate: t.unitPrice, tax: t.gstTotal || 0, total: t.total, user: t.user, method: t.method || 'Cash'
-      })).reverse();
-  }, [transactions]);
+    // default filter: only today's transactions (fromDate..toDate)
+    const start = new Date(fromDate + 'T00:00:00');
+    const end = new Date(toDate + 'T23:59:59');
+    return transactions
+      .filter(t => {
+        const d = new Date(t.date);
+        if (isNaN(d.getTime())) return false;
+        return d >= start && d <= end && t.type === 'SALE';
+      })
+      .map(t => ({ date: new Date(t.date).toLocaleString(), item: t.itemName, qty: t.qty, rate: t.unitPrice, tax: t.gstTotal || 0, total: t.total, user: t.user, method: t.method || 'Cash' }))
+      .reverse();
+  }, [transactions, fromDate, toDate]);
 
   const handleExportSummary = () => {
     downloadCSV(reportData.map((r: any) => ({ 'Period': r.period, 'Revenue': r.sales, 'Expenses': r.expense, 'GST': r.tax, 'Profit': r.net })), `Financials_${period}`, ['Period', 'Revenue', 'Expenses', 'GST', 'Profit']);
+  };
+
+  const handleExportAudit = () => {
+    if (!salesHistory || salesHistory.length === 0) return;
+    const rows = salesHistory.map(s => ({ Timestamp: s.date, Product: s.item, Qty: s.qty, Rate: s.rate, GST: s.tax, Total: s.total, Staff: s.user, Method: s.method }));
+    downloadCSV(rows, `TransactionAudit_${fromDate}_to_${toDate}`, ['Timestamp', 'Product', 'Qty', 'Rate', 'GST', 'Total', 'Staff', 'Method']);
   };
 
   return (
@@ -1089,12 +1180,20 @@ const ReportsView = ({ transactions }: { transactions: Transaction[] }) => {
       <div className="space-y-6">
         <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
            <div className="flex items-center gap-3"><div className="p-2 bg-blue-600 text-white rounded-xl"><History size={20} /></div><div><h3 className="text-lg sm:text-xl font-black uppercase">Transaction Audit</h3><p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">Full History</p></div></div>
+          <div className="flex items-center gap-2 w-full sm:w-auto">
+            <label className="text-[10px] text-slate-500 font-black uppercase tracking-widest">From</label>
+            <input type="date" value={fromDate} onChange={e => setFromDate(e.target.value)} className="p-2 rounded-md border text-sm" />
+            <label className="text-[10px] text-slate-500 font-black uppercase tracking-widest">To</label>
+            <input type="date" value={toDate} onChange={e => setToDate(e.target.value)} className="p-2 rounded-md border text-sm" />
+            <button onClick={() => { setFromDate(todayISO); setToDate(todayISO); }} className="px-3 py-2 bg-slate-100 rounded-md text-xs font-black">Today</button>
+            <button onClick={handleExportAudit} className="p-2 bg-slate-900 text-white rounded-xl hover:bg-black shadow-md ml-2"><FileDown size={16} /></button>
+          </div>
         </div>
         <div className="bg-white rounded-[1.5rem] sm:rounded-[2rem] border overflow-hidden shadow-sm">
           <div className="overflow-x-auto">
             <table className="w-full text-xs sm:text-sm text-left whitespace-nowrap">
               <thead className="text-[10px] text-slate-400 font-black uppercase tracking-widest bg-slate-50">
-                <tr><th className="px-6 py-4 sm:px-8 sm:py-5">Timestamp</th><th className="px-6 py-4 sm:px-8 sm:py-5">Product</th><th className="px-6 py-4 sm:px-8 sm:py-5 text-center">Qty</th><th className="px-6 py-4 sm:px-8 sm:py-5 text-right">Rate</th><th className="px-6 py-4 sm:px-8 sm:py-5 text-right font-black">Total</th><th className="px-6 py-4 sm:px-8 sm:py-5">Staff</th></tr>
+                <tr><th className="px-6 py-4 sm:px-8 sm:py-5">Timestamp</th><th className="px-6 py-4 sm:px-8 sm:py-5">Product</th><th className="px-6 py-4 sm:px-8 sm:py-5 text-center">Qty</th><th className="px-6 py-4 sm:px-8 sm:py-5 text-right">Rate</th><th className="px-6 py-4 sm:px-8 sm:py-5 text-right">GST</th><th className="px-6 py-4 sm:px-8 sm:py-5 text-right font-black">Total</th><th className="px-6 py-4 sm:px-8 sm:py-5">Staff</th></tr>
               </thead>
               <tbody className="divide-y divide-slate-50">
                 {salesHistory.map((s, idx) => (
@@ -1103,6 +1202,7 @@ const ReportsView = ({ transactions }: { transactions: Transaction[] }) => {
                     <td className="px-6 py-4 sm:px-8 sm:py-5 font-bold text-slate-900">{s.item}</td>
                     <td className="px-6 py-4 sm:px-8 sm:py-5 text-center font-bold">{s.qty}</td>
                     <td className="px-6 py-4 sm:px-8 sm:py-5 text-right text-slate-500">{formatCurrency(s.rate)}</td>
+                    <td className="px-6 py-4 sm:px-8 sm:py-5 text-right text-slate-500">{formatCurrency(s.tax)}</td>
                     <td className="px-6 py-4 sm:px-8 sm:py-5 text-right font-black text-slate-900">{formatCurrency(s.total)}</td>
                     <td className="px-6 py-4 sm:px-8 sm:py-5 text-[10px] font-bold text-slate-500 uppercase">{s.user}</td>
                   </tr>
