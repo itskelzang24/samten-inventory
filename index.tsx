@@ -1310,8 +1310,9 @@ const ReportsView = ({ transactions }: { transactions: Transaction[] }) => {
 
   const handleExportAudit = () => {
     if (!salesHistory || salesHistory.length === 0) return;
-    const rows = salesHistory.map(s => ({ Timestamp: s.date, Product: s.item, Qty: s.qty, Rate: s.rate, GST: s.tax, Total: s.total, Staff: s.user, Method: s.method }));
-    downloadCSV(rows, `TransactionAudit_${fromDate}_to_${toDate}`, ['Timestamp', 'Product', 'Qty', 'Rate', 'GST', 'Total', 'Staff', 'Method']);
+    // Export without the Staff column as requested
+    const rows = salesHistory.map(s => ({ Timestamp: s.date, Product: s.item, Qty: s.qty, Rate: s.rate, GST: s.tax, Total: s.total, Method: s.method }));
+    downloadCSV(rows, `TransactionAudit_${fromDate}_to_${toDate}`, ['Timestamp', 'Product', 'Qty', 'Rate', 'GST', 'Total', 'Method']);
   };
 
   return (
