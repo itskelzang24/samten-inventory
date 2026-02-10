@@ -658,6 +658,8 @@ const POSView = ({ products, onBulkSale, user }: any) => {
   const [productQuery, setProductQuery] = useState('');
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [showReceipt, setShowReceipt] = useState(false);
+  const [receiptData, setReceiptData] = useState<any>(null);
 
   const selectedProduct = useMemo(() => products.find((p: any) => p.id === formData.productId), [formData.productId, products]);
 
@@ -694,7 +696,22 @@ const POSView = ({ products, onBulkSale, user }: any) => {
     if (cart.length === 0) return;
     setIsProcessing(true);
     const success = await onBulkSale(cart, formData.method, user);
-    if (success) setCart([]);
+    if (success) {
+      // build receipt data from cart
+      const receipt = {
+        id: `RCPT-${Date.now()}`,
+        date: new Date().toISOString(),
+        items: cart,
+        subtotal,
+        gstAmount,
+        grandTotal,
+        method: formData.method,
+        user
+      } as any;
+      setCart([]);
+      setReceiptData(receipt);
+      setShowReceipt(true);
+    }
     setIsProcessing(false);
   };
 
@@ -865,6 +882,32 @@ const POSView = ({ products, onBulkSale, user }: any) => {
       </div>
     </div>
   );
+};
+
+// Receipt print helper: open a minimal window and invoke print
+const printReceipt = (receipt: any) => {
+  try {
+    const win = window.open('', '_blank', 'width=320,height=600');
+    if (!win) return;
+    const styles = `
+      <style>
+        body { font-family: monospace; padding: 8px; font-size: 12px; }
+        .center { text-align: center; }
+        .line { margin: 6px 0; }
+        table { width: 100%; border-collapse: collapse; }
+        td { vertical-align: top; }
+        @media print { @page { size: 72mm; margin: 4mm; } }
+      </style>
+    `;
+    const itemsHtml = receipt.items.map((it: any) => `<tr><td>${it.name} (${it.qty}x)</td><td style="text-align:right">${formatCurrency(it.total)}</td></tr>`).join('');
+    const html = `<!doctype html><html><head><meta charset="utf-8"><title>Receipt</title>${styles}</head><body><div class="center"><h2>Samten</h2><div class="line">Receipt #: ${receipt.id}</div><div class="line">${new Date(receipt.date).toLocaleString()}</div></div><hr/> <table>${itemsHtml}</table><hr/><div style="display:flex;justify-content:space-between;font-weight:bold"><div>Subtotal</div><div>${formatCurrency(receipt.subtotal)}</div></div><div style="display:flex;justify-content:space-between"><div>GST</div><div>${formatCurrency(receipt.gstAmount)}</div></div><div style="display:flex;justify-content:space-between;font-weight:bold;margin-top:8px"><div>Total</div><div>${formatCurrency(receipt.grandTotal)}</div></div><div class="center line">Thank you</div></body></html>`;
+    win.document.write(html);
+    win.document.close();
+    win.focus();
+    setTimeout(() => { win.print(); /* optional: win.close(); */ }, 500);
+  } catch (e) {
+    console.error('Print failed', e);
+  }
 };
 
 const RestockTypeahead = ({ products, formData, setFormData }: any) => {
@@ -1143,8 +1186,9 @@ const ReportsView = ({ transactions }: { transactions: Transaction[] }) => {
 
   const handleExportAudit = () => {
     if (!salesHistory || salesHistory.length === 0) return;
-    const rows = salesHistory.map(s => ({ Timestamp: s.date, Product: s.item, Qty: s.qty, Rate: s.rate, GST: s.tax, Total: s.total, Staff: s.user, Method: s.method }));
-    downloadCSV(rows, `TransactionAudit_${fromDate}_to_${toDate}`, ['Timestamp', 'Product', 'Qty', 'Rate', 'GST', 'Total', 'Staff', 'Method']);
+    // Exclude Staff from export per request
+    const rows = salesHistory.map(s => ({ Timestamp: s.date, Product: s.item, Qty: s.qty, Rate: s.rate, GST: s.tax, Total: s.total, Method: s.method }));
+    downloadCSV(rows, `TransactionAudit_${fromDate}_to_${toDate}`, ['Timestamp', 'Product', 'Qty', 'Rate', 'GST', 'Total', 'Method']);
   };
 
   return (
