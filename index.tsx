@@ -660,6 +660,21 @@ const POSView = ({ products, onBulkSale, user }: any) => {
   const [isProcessing, setIsProcessing] = useState(false);
   const [showReceipt, setShowReceipt] = useState(false);
   const [receiptData, setReceiptData] = useState<any>(null);
+  // Default to false to avoid unexpected print popups on sale completion
+  const [autoPrint, setAutoPrint] = useState(false);
+
+  // When a sale completes, automatically open the print dialog once.
+  const hasAutoPrintedRef = useRef(false);
+  useEffect(() => {
+    if (autoPrint && showReceipt && receiptData && !hasAutoPrintedRef.current) {
+      hasAutoPrintedRef.current = true;
+      // Small delay to ensure the modal is rendered before printing.
+      setTimeout(() => printReceipt(receiptData), 150);
+    }
+    if (!showReceipt) {
+      hasAutoPrintedRef.current = false;
+    }
+  }, [autoPrint, showReceipt, receiptData]);
 
   const selectedProduct = useMemo(() => products.find((p: any) => p.id === formData.productId), [formData.productId, products]);
 
@@ -711,6 +726,8 @@ const POSView = ({ products, onBulkSale, user }: any) => {
       setCart([]);
       setReceiptData(receipt);
       setShowReceipt(true);
+      // Do not auto-print here; printing is handled by the auto-print effect
+      // or when the user clicks the Print button in the receipt modal.
     }
     setIsProcessing(false);
   };
@@ -863,6 +880,15 @@ const POSView = ({ products, onBulkSale, user }: any) => {
                             <QrCode size={16} /> <span className="text-[8px] font-black uppercase">QR Pay</span>
                          </button>
                       </div>
+                      <label className="mt-3 flex items-center gap-2 text-[10px] font-bold text-slate-300 select-none">
+                        <input
+                          type="checkbox"
+                          className="accent-blue-500"
+                          checked={autoPrint}
+                          onChange={(e) => setAutoPrint(e.target.checked)}
+                        />
+                        Auto-open print after sale
+                      </label>
                    </div>
                    <div className="text-left sm:text-right mt-2 sm:mt-0">
                       <p className="text-slate-500 text-[9px] font-black uppercase tracking-widest mb-0.5">Grand Total</p>
@@ -880,6 +906,79 @@ const POSView = ({ products, onBulkSale, user }: any) => {
           </div>
         </div>
       </div>
+
+      {/* Receipt Modal */}
+      {showReceipt && receiptData && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-md bg-white rounded-3xl shadow-2xl overflow-hidden border">
+            <div className="px-6 py-4 border-b bg-slate-50 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <ReceiptText size={18} className="text-blue-600" />
+                <div>
+                  <p className="text-xs font-black text-slate-900">Receipt Ready</p>
+                  <p className="text-[10px] font-bold text-slate-500">{receiptData.id}</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowReceipt(false)}
+                className="p-2 rounded-xl hover:bg-slate-200/60 text-slate-500"
+                title="Close"
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            <div className="p-5">
+              {/* Simple on-screen preview (thermal-friendly) */}
+              <div className="border rounded-2xl p-4 bg-white">
+                <div className="text-center">
+                  <p className="font-black text-slate-900">Samten Tshongkhang</p>
+                  <p className="text-[10px] font-bold text-slate-500">{new Date(receiptData.date).toLocaleString()}</p>
+                </div>
+                <div className="border-t my-3" />
+                <div className="space-y-2">
+                  {receiptData.items.map((it: any) => (
+                    <div key={it.id} className="flex justify-between text-xs">
+                      <div className="pr-2">
+                        <p className="font-bold text-slate-900 leading-4">{it.name}</p>
+                        <p className="text-[10px] text-slate-500 font-bold">{it.qty} x {formatCurrency(it.unitPrice)}</p>
+                      </div>
+                      <div className="font-black text-slate-900">{formatCurrency(it.total)}</div>
+                    </div>
+                  ))}
+                </div>
+                <div className="border-t my-3" />
+                <div className="space-y-1 text-[11px] font-bold">
+                  <div className="flex justify-between"><span className="text-slate-500">Subtotal</span><span className="text-slate-900">{formatCurrency(receiptData.subtotal)}</span></div>
+                  <div className="flex justify-between"><span className="text-slate-500">GST (5%)</span><span className="text-slate-900">{formatCurrency(receiptData.gstAmount)}</span></div>
+                  <div className="flex justify-between text-sm font-black pt-1"><span>Total</span><span>{formatCurrency(receiptData.grandTotal)}</span></div>
+                  <div className="flex justify-between"><span className="text-slate-500">Paid By</span><span className="text-slate-900">{receiptData.method}</span></div>
+                </div>
+                <div className="border-t my-3" />
+                <p className="text-center text-[10px] font-bold text-slate-500">Thank you</p>
+              </div>
+
+              <div className="mt-4 grid grid-cols-2 gap-3">
+                <button
+                  onClick={() => printReceipt(receiptData)}
+                  className="py-3 rounded-2xl bg-blue-600 text-white font-black text-[10px] uppercase tracking-widest hover:bg-blue-700 active:scale-95 transition-all"
+                >
+                  Print
+                </button>
+                <button
+                  onClick={() => setShowReceipt(false)}
+                  className="py-3 rounded-2xl bg-slate-900 text-white font-black text-[10px] uppercase tracking-widest hover:bg-slate-800 active:scale-95 transition-all"
+                >
+                  Done
+                </button>
+              </div>
+              <p className="mt-3 text-[10px] text-slate-500 font-bold">
+                Note: The browser print dialog will use the PC’s default printer. Set your thermal printer as default for one-click printing.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
@@ -900,7 +999,7 @@ const printReceipt = (receipt: any) => {
       </style>
     `;
     const itemsHtml = receipt.items.map((it: any) => `<tr><td>${it.name} (${it.qty}x)</td><td style="text-align:right">${formatCurrency(it.total)}</td></tr>`).join('');
-    const html = `<!doctype html><html><head><meta charset="utf-8"><title>Receipt</title>${styles}</head><body><div class="center"><h2>Samten</h2><div class="line">Receipt #: ${receipt.id}</div><div class="line">${new Date(receipt.date).toLocaleString()}</div></div><hr/> <table>${itemsHtml}</table><hr/><div style="display:flex;justify-content:space-between;font-weight:bold"><div>Subtotal</div><div>${formatCurrency(receipt.subtotal)}</div></div><div style="display:flex;justify-content:space-between"><div>GST</div><div>${formatCurrency(receipt.gstAmount)}</div></div><div style="display:flex;justify-content:space-between;font-weight:bold;margin-top:8px"><div>Total</div><div>${formatCurrency(receipt.grandTotal)}</div></div><div class="center line">Thank you</div></body></html>`;
+  const html = `<!doctype html><html><head><meta charset="utf-8"><title>Receipt</title>${styles}</head><body><div class="center"><h2>Samten Tshongkhang</h2><div class="line">Receipt #: ${receipt.id}</div><div class="line">${new Date(receipt.date).toLocaleString()}</div></div><hr/> <table>${itemsHtml}</table><hr/><div style="display:flex;justify-content:space-between;font-weight:bold"><div>Subtotal</div><div>${formatCurrency(receipt.subtotal)}</div></div><div style="display:flex;justify-content:space-between"><div>GST</div><div>${formatCurrency(receipt.gstAmount)}</div></div><div style="display:flex;justify-content:space-between;font-weight:bold;margin-top:8px"><div>Total</div><div>${formatCurrency(receipt.grandTotal)}</div></div><div class="center line">Thank you</div></body></html>`;
     win.document.write(html);
     win.document.close();
     win.focus();
@@ -1055,6 +1154,28 @@ const InventoryView = ({ products, onAdd, onEdit }: any) => {
   const [newCategory, setNewCategory] = useState('');
   const [localCategories, setLocalCategories] = useState<string[]>(categories);
 
+  // Export current inventory to CSV (Excel-compatible)
+  const exportInventory = () => {
+    if (!products || products.length === 0) {
+      alert('No products to export');
+      return;
+    }
+    const headers = ['SKU','Name','Category','Unit','Cost Price','Selling Price','Current Stock','Min Stock','Supplier','Status'];
+    const data = products.map((p: Product) => ({
+      'SKU': p.id,
+      'Name': p.name,
+      'Category': p.category,
+      'Unit': p.unit,
+      'Cost Price': p.costPrice,
+      'Selling Price': p.sellingPrice,
+      'Current Stock': `${p.currentStock} ${p.unit}`,
+      'Min Stock': p.minStock,
+      'Supplier': p.supplier || '',
+      'Status': p.status || ''
+    }));
+    downloadCSV(data, 'inventory', headers);
+  };
+
   // Keep localCategories in sync with upstream categories but preserve any user-added ones
   useEffect(() => {
     setLocalCategories(prev => Array.from(new Set([...prev, ...categories])));
@@ -1085,7 +1206,10 @@ const InventoryView = ({ products, onAdd, onEdit }: any) => {
     <div className="space-y-6">
       <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
         <h3 className="text-lg sm:text-xl font-black text-slate-900 uppercase">Product Registry</h3>
-        <button onClick={() => { setEditItem(null); setIsAdding(true); }} className="w-full sm:w-auto bg-slate-900 text-white px-8 py-3 rounded-xl sm:rounded-2xl flex items-center justify-center gap-2 font-black shadow-lg text-[10px] uppercase hover:bg-black transition-all"><Plus size={18} /> New Item</button>
+        <div className="flex items-center gap-3 w-full sm:w-auto">
+          <button onClick={exportInventory} className="hidden sm:inline-flex bg-white border border-slate-200 text-slate-700 px-4 py-2 rounded-xl sm:rounded-2xl flex items-center justify-center gap-2 font-bold text-[10px] uppercase hover:bg-slate-50 transition-all"><Download size={16} /> Export to Excel</button>
+          <button onClick={() => { setEditItem(null); setIsAdding(true); }} className="w-full sm:w-auto bg-slate-900 text-white px-8 py-3 rounded-xl sm:rounded-2xl flex items-center justify-center gap-2 font-black shadow-lg text-[10px] uppercase hover:bg-black transition-all"><Plus size={18} /> New Item</button>
+        </div>
       </div>
       {(isAdding || editItem) && (
         <div className="bg-white p-6 sm:p-10 rounded-[1.5rem] sm:rounded-[2rem] border shadow-xl animate-in slide-in-from-top-4">
@@ -1186,9 +1310,8 @@ const ReportsView = ({ transactions }: { transactions: Transaction[] }) => {
 
   const handleExportAudit = () => {
     if (!salesHistory || salesHistory.length === 0) return;
-    // Exclude Staff from export per request
-    const rows = salesHistory.map(s => ({ Timestamp: s.date, Product: s.item, Qty: s.qty, Rate: s.rate, GST: s.tax, Total: s.total, Method: s.method }));
-    downloadCSV(rows, `TransactionAudit_${fromDate}_to_${toDate}`, ['Timestamp', 'Product', 'Qty', 'Rate', 'GST', 'Total', 'Method']);
+    const rows = salesHistory.map(s => ({ Timestamp: s.date, Product: s.item, Qty: s.qty, Rate: s.rate, GST: s.tax, Total: s.total, Staff: s.user, Method: s.method }));
+    downloadCSV(rows, `TransactionAudit_${fromDate}_to_${toDate}`, ['Timestamp', 'Product', 'Qty', 'Rate', 'GST', 'Total', 'Staff', 'Method']);
   };
 
   return (
