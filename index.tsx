@@ -1,4 +1,7 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
+// Inform TypeScript about the external module (no types bundled)
+// @ts-ignore - jsbarcode may not provide types in this project
+import JsBarcode from 'jsbarcode';
 import { createRoot } from 'react-dom/client';
 import { 
   LayoutDashboard, 
@@ -94,12 +97,15 @@ type Product = {
   id: string;
   name: string;
   category: string;
+  size?: string;
   unit: string;
   costPrice: number;
   sellingPrice: number;
   currentStock: number;
   minStock: number;
   supplier: string;
+  barcode?: string;
+  barcodeSvg?: string;
   status: 'Active' | 'Inactive';
 };
 
@@ -171,6 +177,71 @@ const downloadCSV = (data: any[], filename: string, headers: string[]) => {
   document.body.appendChild(link);
   link.click();
   document.body.removeChild(link);
+};
+
+// Generate a scannable Code128 SVG using JsBarcode (preferred).
+const generateBarcodeSvg = (text: string, opts: { height?: number, width?: number, margin?: number } = {}) => {
+  const height = opts.height ?? 60;
+  const width = opts.width ?? 2;
+  const margin = opts.margin ?? 0;
+  try {
+    // create SVG element and render Code128 barcode into it
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    // JsBarcode may not have types here — cast to any
+    (JsBarcode as any)(svg, String(text || ''), { format: 'CODE128', lineColor: '#000', width, height, displayValue: false, margin });
+    // add human-readable text below
+    const wrapper = document.createElement('div');
+    wrapper.appendChild(svg);
+    const txt = document.createElement('div');
+    txt.style.textAlign = 'center';
+    txt.style.fontFamily = 'monospace';
+    txt.style.fontSize = '12px';
+    txt.style.marginTop = '6px';
+    txt.textContent = String(text || '');
+    wrapper.appendChild(txt);
+    return wrapper.innerHTML;
+  } catch (e) {
+    console.warn('JsBarcode failed, falling back to simple visual barcode', e);
+    // fallback to previous simple generator
+    const heightF = opts.height ?? 48;
+    const scale = opts.width ?? 2;
+    const marginF = opts.margin ?? 8;
+    const t = (text || '').toString().toUpperCase();
+    const bits: number[] = [];
+    for (let i = 0; i < t.length; i++) {
+      const code = t.charCodeAt(i);
+      for (let b = 7; b >= 0; b--) bits.push((code >> b) & 1);
+      bits.push(0);
+    }
+    let x = marginF;
+    const barElems: string[] = [];
+    for (let i = 0; i < bits.length; i++) {
+      const bit = bits[i];
+      if (bit === 1) barElems.push(`<rect x="${x}" y="0" width="${scale}" height="${heightF}" fill="#000" />`);
+      x += scale;
+    }
+    const widthF = x + marginF;
+    const textY = heightF + 14;
+    const svg = `<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="${widthF}" height="${heightF + 28}" viewBox="0 0 ${widthF} ${heightF + 28}">\n  <rect width="100%" height="100%" fill="#fff" />\n  <g>${barElems.join('')}</g>\n  <text x="50%" y="${textY}" font-family="monospace" font-size="12" fill="#000" text-anchor="middle">${t}</text>\n</svg>`;
+    return svg;
+  }
+};
+
+// Print a barcode label for a product (opens print window)
+const printLabel = (p: Product) => {
+  try {
+    const win = window.open('', '_blank', 'width=320,height=400');
+    if (!win) return;
+  const svg = p.barcodeSvg || generateBarcodeSvg(p.id, { height: 60, width: 2 });
+    const escaped = svg.replace(/</g, '\u003c');
+    const html = `<!doctype html><html><head><meta charset="utf-8"><title>Label ${p.id}</title><style>body{font-family:Arial,sans-serif;padding:8px;} .box{width:300px}</style></head><body><div class="box"><div>${escaped}</div><div style="margin-top:8px;font-weight:bold">${p.name}</div><div style="font-size:12px;color:#555">SKU: ${p.id}</div></div></body></html>`;
+    win.document.write(html);
+    win.document.close();
+    win.focus();
+    setTimeout(() => { win.print(); }, 400);
+  } catch (e) {
+    console.error('Print label failed', e);
+  }
 };
 
 // --- Constants ---
@@ -657,6 +728,14 @@ const POSView = ({ products, onBulkSale, user }: any) => {
   const [formData, setFormData] = useState({ productId: '', qty: '', unitPrice: '', method: 'Cash' });
   const [productQuery, setProductQuery] = useState('');
   const [showSuggestions, setShowSuggestions] = useState(false);
+
+  // Barcode scanner (USB scanners usually behave like a keyboard + Enter)
+  const [scanValue, setScanValue] = useState('');
+  const [autoAddOnScan, setAutoAddOnScan] = useState(true);
+  const scanRef = useRef<HTMLInputElement | null>(null);
+  const scannerBuffer = useRef('');
+  const scannerTimer = useRef<number | null>(null);
+  const [scanFeedback, setScanFeedback] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
   const [showReceipt, setShowReceipt] = useState(false);
   const [receiptData, setReceiptData] = useState<any>(null);
@@ -677,6 +756,117 @@ const POSView = ({ products, onBulkSale, user }: any) => {
   }, [autoPrint, showReceipt, receiptData]);
 
   const selectedProduct = useMemo(() => products.find((p: any) => p.id === formData.productId), [formData.productId, products]);
+
+  const findProductByBarcode = (codeRaw: string) => {
+    const code = (codeRaw || '').trim();
+    if (!code) return null;
+    const normalized = code.replace(/\s+/g, '');
+    return (
+      products.find((p: any) => String(p.barcode || '').trim() === code) ||
+      products.find((p: any) => String(p.id || '').trim() === code) ||
+      products.find((p: any) => String(p.barcode || '').replace(/\s+/g, '') === normalized) ||
+      products.find((p: any) => String(p.id || '').replace(/\s+/g, '') === normalized) ||
+      null
+    );
+  };
+
+  // Global keyboard-wedge capture: accumulate fast key events and on Enter treat as scan
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      try {
+        const active = document.activeElement as Element | null;
+        const tag = active && (active.tagName || '').toLowerCase();
+        // If user is typing into an input/textarea (except our hidden/scan input), don't intercept
+        if (active && (tag === 'input' || tag === 'textarea' || (active as HTMLElement).isContentEditable)) {
+          if (scanRef.current && active === scanRef.current) {
+            // allow the focused scan input to handle Enter via its onKeyDown
+          } else {
+            return;
+          }
+        }
+
+        if (e.key === 'Enter') {
+          const code = scannerBuffer.current.trim();
+          scannerBuffer.current = '';
+          if (code) {
+            handleScanSubmit(code);
+            setScanFeedback(`Scanned: ${code}`);
+            window.setTimeout(() => setScanFeedback(''), 1200);
+          }
+          return;
+        }
+
+        // Only collect printable single characters
+        if (e.key.length === 1) {
+          scannerBuffer.current += e.key;
+          if (scannerTimer.current) window.clearTimeout(scannerTimer.current);
+          scannerTimer.current = window.setTimeout(() => { scannerBuffer.current = ''; scannerTimer.current = null; }, 150);
+        }
+      } catch (err) {
+        // ignore
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      if (scannerTimer.current) window.clearTimeout(scannerTimer.current);
+    };
+  }, []);
+
+  const addOrIncrementCartItem = (p: any, qtyToAdd: number) => {
+    setCart(prev => {
+      const idx = prev.findIndex(i => i.productId === p.id);
+      if (idx >= 0) {
+        const next = [...prev];
+        const existing = next[idx];
+        const newQty = existing.qty + qtyToAdd;
+        next[idx] = { ...existing, qty: newQty, total: newQty * existing.unitPrice };
+        return next;
+      }
+      const unitPrice = Number(p.sellingPrice) || 0;
+      return [
+        ...prev,
+        {
+          id: Math.random().toString(36).substr(2, 9),
+          productId: p.id,
+          name: p.name,
+          qty: qtyToAdd,
+          unitPrice,
+          total: qtyToAdd * unitPrice
+        }
+      ];
+    });
+  };
+
+  const handleScanSubmit = (code: string) => {
+    const p = findProductByBarcode(code);
+    if (!p) {
+      alert(`No product found for barcode/SKU: ${code}`);
+      return;
+    }
+    if (p.status !== 'Active') {
+      alert(`Product is inactive: ${p.name}`);
+      return;
+    }
+    if (p.currentStock <= 0) {
+      alert(`Out of stock: ${p.name}`);
+      return;
+    }
+
+    if (autoAddOnScan) {
+      // Add qty=1 per scan
+      addOrIncrementCartItem(p, 1);
+      // keep the selection form clean
+      setFormData(prev => ({ ...prev, productId: '', qty: '', unitPrice: '', method: prev.method }));
+      setProductQuery('');
+      setShowSuggestions(false);
+    } else {
+      // Just select the product in the form (user enters qty & rate)
+      setFormData(prev => ({ ...prev, productId: p.id, unitPrice: p.sellingPrice }));
+      setProductQuery(p.name);
+      setShowSuggestions(false);
+    }
+  };
 
   const handleAddToCart = (e: React.FormEvent) => {
     e.preventDefault();
@@ -742,6 +932,57 @@ const POSView = ({ products, onBulkSale, user }: any) => {
               <Plus className="text-blue-600" size={20} /> Item Selection
             </h3>
             <form onSubmit={handleAddToCart} className="space-y-4 sm:space-y-5">
+              <div>
+                <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Scan barcode / SKU</label>
+                {/* Big touch-friendly button to focus the scanner input (useful for USB scanners and touchscreens) */}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setScanValue('');
+                    // Focus must happen after click; setTimeout ensures it lands reliably
+                    setTimeout(() => scanRef.current?.focus(), 0);
+                  }}
+                  className="w-full mb-2 p-3 sm:p-4 rounded-xl sm:rounded-2xl bg-slate-900 text-white font-black flex items-center justify-center gap-2 hover:bg-slate-800 active:scale-[0.99] transition"
+                  title="Tap here, then scan the barcode"
+                >
+                  <QrCode size={18} />
+                  Tap to Scan
+                </button>
+                <div className="flex gap-2">
+                  <input
+                    ref={scanRef}
+                    type="text"
+                    inputMode="none"
+                    className="flex-1 p-3 sm:p-4 bg-slate-50 border border-slate-200 rounded-xl sm:rounded-2xl font-bold outline-none focus:ring-4 focus:ring-blue-100 transition-all text-sm font-mono"
+                    placeholder="(Focused) Scan barcode / SKU…"
+                    value={scanValue}
+                    onChange={(e) => setScanValue(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        const code = scanValue.trim();
+                        setScanValue('');
+                        if (code) handleScanSubmit(code);
+                        // keep focus so repeated scans are fast
+                        setTimeout(() => scanRef.current?.focus(), 0);
+                      }
+                    }}
+                  />
+                </div>
+                {scanFeedback && (
+                  <div className="mt-2 text-sm font-bold text-green-600">{scanFeedback}</div>
+                )}
+                <label className="mt-2 flex items-center gap-2 text-[10px] font-bold text-slate-500 select-none">
+                  <input
+                    type="checkbox"
+                    className="accent-blue-500"
+                    checked={autoAddOnScan}
+                    onChange={(e) => setAutoAddOnScan(e.target.checked)}
+                  />
+                  Auto-add 1 item on scan
+                </label>
+              </div>
+
               <div className="relative">
                 <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Product</label>
                 <input
@@ -1147,7 +1388,7 @@ const RestockView = ({ products, onRestock, user }: any) => {
 const InventoryView = ({ products, onAdd, onEdit }: any) => {
   const [isAdding, setIsAdding] = useState(false);
   const [editItem, setEditItem] = useState<any>(null);
-  const [formData, setFormData] = useState<any>({ id: '', name: '', category: 'General', unit: 'Pcs', costPrice: '', sellingPrice: '', currentStock: '', minStock: '5', supplier: '', status: 'Active' });
+  const [formData, setFormData] = useState<any>({ id: '', name: '', category: 'General', size: '', unit: 'Pcs', costPrice: '', sellingPrice: '', currentStock: '', minStock: '5', supplier: '', status: 'Active' });
   const categories = useMemo(() => Array.from(new Set(products.map((p: any) => String(p.category || 'General').trim()))).sort(), [products]);
 
   const [showNewCategory, setShowNewCategory] = useState(false);
@@ -1176,6 +1417,45 @@ const InventoryView = ({ products, onAdd, onEdit }: any) => {
     downloadCSV(data, 'inventory', headers);
   };
 
+  const escapeHtml = (unsafe: string) => {
+    return (unsafe || '').replace(/[&<>"]+/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' } as any)[m] || m);
+  };
+
+  const exportAllLabels = () => {
+    if (!products || products.length === 0) { alert('No products to export'); return; }
+    const itemsHtml = products.map((p: Product) => {
+      const svg = p.barcodeSvg || generateBarcodeSvg(p.id, { height: 60, width: 2 });
+      // ensure the svg/html is safe to embed
+      const content = String(svg);
+      // one-column: each label is a full-width row
+      return `
+        <div class="label" style="display:block;width:100%;box-sizing:border-box;padding:12px 8px;border-bottom:1px solid #eee;page-break-inside:avoid;background:#fff;">
+          <div style="display:flex;align-items:center;gap:12px;">
+            <div style="flex:0 0 160px;max-width:160px;overflow:hidden;background:#fff;padding:4px;border-radius:4px;">
+              <div style="width:100%;height:100%;display:block;">
+                ${content}
+              </div>
+            </div>
+            <div style="flex:1;min-width:0;padding-left:6px;">
+              <div style="font-weight:700;font-size:14px;color:#111;background:#fff;padding:2px 0;">${escapeHtml(p.name)}</div>
+              <div style="font-family:monospace;font-size:12px;color:#333;margin-top:6px;background:#fff;padding:2px 0">SKU: ${escapeHtml(p.id)}</div>
+            </div>
+          </div>
+        </div>`;
+    }).join('\n');
+
+    const html = `<!doctype html><html><head><meta charset="utf-8"><title>All Labels</title><style>body{font-family:Arial,Helvetica,sans-serif;padding:8px;margin:0} @media print{ @page{ size: 72mm auto; margin: 4mm } .label{page-break-inside:avoid}} .label{background:#fff}</style></head><body>${itemsHtml}</body></html>`;
+    const blob = new Blob([html], { type: 'text/html' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `labels_all_${new Date().toISOString().split('T')[0]}.html`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
   // Keep localCategories in sync with upstream categories but preserve any user-added ones
   useEffect(() => {
     setLocalCategories(prev => Array.from(new Set([...prev, ...categories])));
@@ -1189,16 +1469,68 @@ const InventoryView = ({ products, onAdd, onEdit }: any) => {
   // Initialize form when starting to add. Do NOT reset when categories change to avoid clearing user input.
   useEffect(() => {
     if (isAdding) {
-      setFormData({ id: '', name: '', category: categories[0] || 'General', unit: 'Pcs', costPrice: '', sellingPrice: '', currentStock: '', minStock: '5', supplier: '', status: 'Active' });
+      setFormData({ id: '', name: '', category: categories[0] || 'General', size: '', unit: 'Pcs', costPrice: '', sellingPrice: '', currentStock: '', minStock: '5', supplier: '', status: 'Active' });
       setShowNewCategory(false);
       setNewCategory('');
     }
   }, [isAdding]);
 
+  // Generate SKU using pattern: CAT-ITEM-SIZE-XXX (auto increment per CAT+ITEM+SIZE)
+  const generateSKU = (name: string, category: string, size: string) => {
+    const alphaNum = (s: string) => (s || '').toString().toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const makeCat = (c: string) => {
+      if (!c) return 'GEN';
+      const parts = c.split(/\s+/).filter(Boolean);
+      if (parts.length === 1) return alphaNum(parts[0]).slice(0,3).padEnd(3,'X');
+      return alphaNum(parts.map(p=>p[0]).join('')).slice(0,3).padEnd(3,'X');
+    };
+    const makeItem = (n: string) => {
+      const s = alphaNum(n);
+      return s.slice(0,4).padEnd(4,'X');
+    };
+    const catCode = makeCat(category);
+    const itemCode = makeItem(name);
+    const sizeCode = (size || 'NA').toString().toUpperCase();
+    const prefix = `${catCode}-${itemCode}-${sizeCode}-`;
+    // find max existing number
+    const matches = products
+      .map((p: any) => p.id || '')
+      .filter((id: string) => id.startsWith(prefix))
+      .map((id: string) => {
+        const parts = id.split('-');
+        const last = parts[parts.length-1];
+        const num = parseInt(last, 10);
+        return isNaN(num) ? 0 : num;
+      });
+    const max = matches.length ? Math.max(...matches) : 0;
+    const next = (max + 1).toString().padStart(3, '0');
+    return `${prefix}${next}`;
+  };
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (editItem) onEdit({...formData}, editItem.id);
-    else onAdd({...formData});
+    if (editItem) {
+      onEdit({...formData}, editItem.id);
+    } else {
+      // auto-generate SKU and barcode if not provided
+      const sku = formData.id && formData.id.trim() !== '' ? formData.id.trim() : generateSKU(formData.name, formData.category, formData.size);
+      const barcode = sku; // simple: use SKU as barcode
+      const newProd: Product & { barcode?: string, size?: string } = {
+        id: sku,
+        name: formData.name,
+        category: formData.category,
+        size: formData.size || '',
+        unit: formData.unit,
+        costPrice: Number(formData.costPrice) || 0,
+        sellingPrice: Number(formData.sellingPrice) || 0,
+        currentStock: Number(formData.currentStock) || 0,
+        minStock: Number(formData.minStock) || 0,
+        supplier: formData.supplier || '',
+        status: formData.status || 'Active',
+        barcode
+      } as any;
+      onAdd({...newProd});
+    }
     setEditItem(null); setIsAdding(false);
   };
 
@@ -1208,6 +1540,7 @@ const InventoryView = ({ products, onAdd, onEdit }: any) => {
         <h3 className="text-lg sm:text-xl font-black text-slate-900 uppercase">Product Registry</h3>
         <div className="flex items-center gap-3 w-full sm:w-auto">
           <button onClick={exportInventory} className="hidden sm:inline-flex bg-white border border-slate-200 text-slate-700 px-4 py-2 rounded-xl sm:rounded-2xl flex items-center justify-center gap-2 font-bold text-[10px] uppercase hover:bg-slate-50 transition-all"><Download size={16} /> Export to Excel</button>
+          <button onClick={exportAllLabels} className="hidden sm:inline-flex bg-white border border-slate-200 text-slate-700 px-4 py-2 rounded-xl sm:rounded-2xl flex items-center justify-center gap-2 font-bold text-[10px] uppercase hover:bg-slate-50 transition-all"><Tag size={16} /> Download Labels</button>
           <button onClick={() => { setEditItem(null); setIsAdding(true); }} className="w-full sm:w-auto bg-slate-900 text-white px-8 py-3 rounded-xl sm:rounded-2xl flex items-center justify-center gap-2 font-black shadow-lg text-[10px] uppercase hover:bg-black transition-all"><Plus size={18} /> New Item</button>
         </div>
       </div>
@@ -1216,7 +1549,16 @@ const InventoryView = ({ products, onAdd, onEdit }: any) => {
           <div className="flex justify-between items-center mb-6 sm:mb-8"><h4 className="font-black text-slate-900 text-base sm:text-lg flex items-center gap-2"><Layers className="text-blue-600" /> {editItem ? 'Update Profile' : 'New Goods Entry'}</h4><button onClick={() => { setIsAdding(false); setEditItem(null); }} className="p-2 text-slate-400 hover:bg-slate-100 rounded-full transition-colors"><X size={20} /></button></div>
           <form onSubmit={handleSubmit} className="space-y-4 sm:space-y-6 text-sm">
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 sm:gap-5">
-              <div className="col-span-1"><label className="block text-[10px] font-black text-slate-400 mb-1 uppercase tracking-widest">SKU/ID</label><input className="w-full p-3 bg-slate-50 border rounded-xl font-bold outline-none" required value={formData.id} onChange={e => setFormData({...formData, id: e.target.value})} /></div>
+              <div className="col-span-1">
+                <label className="block text-[10px] font-black text-slate-400 mb-1 uppercase tracking-widest">SKU/ID</label>
+                <input
+                  className={`w-full p-3 border rounded-xl font-bold outline-none ${isAdding && !editItem ? 'bg-slate-100 cursor-not-allowed text-slate-500' : 'bg-slate-50'}`}
+                  placeholder={isAdding && !editItem ? 'Auto-generated (locked)' : ''}
+                  value={formData.id}
+                  readOnly={isAdding && !editItem}
+                  onChange={e => setFormData({...formData, id: e.target.value})}
+                />
+              </div>
               <div className="sm:col-span-1 lg:col-span-2"><label className="block text-[10px] font-black text-slate-400 mb-1 uppercase tracking-widest">Name</label><input className="w-full p-3 bg-slate-50 border rounded-xl font-bold outline-none" required value={formData.name} onChange={e => setFormData({...formData, name: e.target.value})} /></div>
               <div className="col-span-1">
                 <label className="block text-[10px] font-black text-slate-400 mb-1 uppercase tracking-widest">Category</label>
@@ -1235,13 +1577,23 @@ const InventoryView = ({ products, onAdd, onEdit }: any) => {
                   </div>
                 )}
               </div>
+              <div className="col-span-1"><label className="block text-[10px] font-black text-slate-400 mb-1 uppercase tracking-widest">Size</label><input className="w-full p-3 bg-slate-50 border rounded-xl font-bold outline-none" placeholder="e.g. S, M, L, XL" value={formData.size} onChange={e => setFormData({...formData, size: e.target.value})} /></div>
               <div className="col-span-1"><label className="block text-[10px] font-black text-slate-400 mb-1 uppercase tracking-widest">Unit</label><input className="w-full p-3 bg-slate-50 border rounded-xl font-bold outline-none" value={formData.unit} onChange={e => setFormData({...formData, unit: e.target.value})} /></div>
               <div className="col-span-1"><label className="block text-[10px] font-black text-slate-400 mb-1 uppercase tracking-widest">Purchase Nu.</label><input type="number" className="w-full p-3 bg-slate-50 border rounded-xl font-bold outline-none" value={formData.costPrice} onChange={e => setFormData({...formData, costPrice: e.target.value})} /></div>
               <div className="col-span-1"><label className="block text-[10px] font-black text-slate-400 mb-1 uppercase tracking-widest">Retail Nu.</label><input type="number" className="w-full p-3 bg-slate-50 border rounded-xl font-bold outline-none" value={formData.sellingPrice} onChange={e => setFormData({...formData, sellingPrice: e.target.value})} /></div>
               <div className="col-span-1"><label className="block text-[10px] font-black text-slate-400 mb-1 uppercase tracking-widest">Stock</label><input type="number" className="w-full p-3 bg-slate-50 border rounded-xl font-bold outline-none" value={formData.currentStock} onChange={e => setFormData({...formData, currentStock: e.target.value})} /></div>
               <div className="col-span-1"><label className="block text-[10px) font-black text-slate-400 mb-1 uppercase tracking-widest">Alert Threshold</label><input type="number" className="w-full p-3 bg-slate-50 border rounded-xl font-bold outline-none" value={formData.minStock} onChange={e => setFormData({...formData, minStock: e.target.value})} /></div>
             </div>
-            <div className="pt-6 sm:pt-8 border-t flex flex-col sm:flex-row justify-end gap-3"><button type="button" onClick={() => { setIsAdding(false); setEditItem(null); }} className="px-8 py-3 text-slate-400 font-black uppercase text-[10px] tracking-widest order-2 sm:order-1">Cancel</button><button type="submit" className="px-10 py-3 bg-blue-600 text-white font-black rounded-xl sm:rounded-2xl uppercase text-[10px] tracking-widest hover:bg-blue-700 transition-all shadow-xl order-1 sm:order-2">Confirm Registry</button></div>
+            <div className="pt-6 sm:pt-8 border-t flex flex-col sm:flex-row justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => { setIsAdding(false); setEditItem(null); }}
+                className="px-8 py-3 bg-red-50 text-red-700 font-black uppercase text-[10px] tracking-widest rounded-lg hover:bg-red-100 transition-colors order-2 sm:order-1 border border-red-100"
+              >
+                Cancel
+              </button>
+              <button type="submit" className="px-10 py-3 bg-blue-600 text-white font-black rounded-xl sm:rounded-2xl uppercase text-[10px] tracking-widest hover:bg-blue-700 transition-all shadow-xl order-1 sm:order-2">Confirm Registry</button>
+            </div>
           </form>
         </div>
       )}
@@ -1254,13 +1606,18 @@ const InventoryView = ({ products, onAdd, onEdit }: any) => {
             <tbody className="divide-y divide-slate-50">
               {products.map((p: Product) => (
                 <tr key={p.id} className="hover:bg-slate-50 transition-colors">
-                  <td className="px-6 py-4 sm:px-8 sm:py-5 font-mono text-[10px] text-slate-400">{p.id}</td>
-                  <td className="px-6 py-4 sm:px-8 sm:py-5 font-black text-slate-900">{p.name}</td>
-                  <td className="px-6 py-4 sm:px-8 sm:py-5 font-bold text-slate-500 text-[10px] uppercase">{p.category}</td>
-                  <td className="px-6 py-4 sm:px-8 sm:py-5 text-right font-black text-slate-900">{formatCurrency(p.sellingPrice)}</td>
-                  <td className="px-6 py-4 sm:px-8 sm:py-5 text-center"><span className={`px-3 py-1 rounded-lg text-[9px] font-black uppercase ${p.currentStock <= p.minStock ? 'bg-red-50 text-red-600 border border-red-100' : 'bg-green-50 text-green-700'}`}>{p.currentStock} {p.unit}</span></td>
-                  <td className="px-6 py-4 sm:px-8 sm:py-5 text-center"><button className="p-2 text-slate-400 hover:text-blue-600 rounded-xl transition-all" onClick={() => setEditItem(p)}><Pencil size={14} /></button></td>
-                </tr>
+                    <td className="px-6 py-4 sm:px-8 sm:py-5 font-mono text-[10px] text-slate-400">{p.id}</td>
+                    <td className="px-6 py-4 sm:px-8 sm:py-5 font-black text-slate-900">{p.name}</td>
+                    <td className="px-6 py-4 sm:px-8 sm:py-5 font-bold text-slate-500 text-[10px] uppercase">{p.category}</td>
+                    <td className="px-6 py-4 sm:px-8 sm:py-5 text-right font-black text-slate-900">{formatCurrency(p.sellingPrice)}</td>
+                    <td className="px-6 py-4 sm:px-8 sm:py-5 text-center"><span className={`px-3 py-1 rounded-lg text-[9px] font-black uppercase ${p.currentStock <= p.minStock ? 'bg-red-50 text-red-600 border border-red-100' : 'bg-green-50 text-green-700'}`}>{p.currentStock} {p.unit}</span></td>
+                    <td className="px-6 py-4 sm:px-8 sm:py-5 text-center">
+                      <div className="flex items-center justify-center gap-2">
+                        <button className="p-2 text-slate-400 hover:text-slate-700 rounded-xl transition-all" onClick={() => printLabel(p)} title="Print label">Label</button>
+                        <button className="p-2 text-slate-400 hover:text-blue-600 rounded-xl transition-all" onClick={() => setEditItem(p)}><Pencil size={14} /></button>
+                      </div>
+                    </td>
+                  </tr>
               ))}
               {products.length === 0 && <tr><td colSpan={6} className="py-20 text-center text-slate-300 italic">Inventory is empty.</td></tr>}
             </tbody>
