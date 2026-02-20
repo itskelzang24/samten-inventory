@@ -737,6 +737,9 @@ const POSView = ({ products, onBulkSale, user }: any) => {
   const scannerTimer = useRef<number | null>(null);
   const [scanFeedback, setScanFeedback] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
+  const [showWebcam, setShowWebcam] = useState(false);
+  const videoRef = useRef<HTMLDivElement | null>(null);
+  const quaggaOnDetectedRef = useRef<any>(null);
   const [showReceipt, setShowReceipt] = useState(false);
   const [receiptData, setReceiptData] = useState<any>(null);
   // Default to false to avoid unexpected print popups on sale completion
@@ -868,6 +871,179 @@ const POSView = ({ products, onBulkSale, user }: any) => {
     }
   };
 
+  // Webcam scanner using ZXing-js (loaded from CDN via dynamic import)
+  const zxingReaderRef = useRef<any>(null);
+  const zxingVideoElemRef = useRef<HTMLVideoElement | null>(null);
+
+  const loadZXing = () => new Promise<any>((resolve, reject) => {
+    // If ZXing UMD is already present, resolve immediately
+    const win = (window as any);
+    if (win.BrowserMultiFormatReader || win.ZXing || win.BrowserBarcodeReader) return resolve(win);
+    const tryUrls = [
+      'https://unpkg.com/@zxing/library@0.18.6/umd/index.min.js',
+      'https://unpkg.com/@zxing/library/umd/index.min.js',
+      'https://cdn.jsdelivr.net/npm/@zxing/library@0.18.6/umd/index.min.js',
+      'https://cdn.jsdelivr.net/npm/@zxing/library/umd/index.min.js'
+    ];
+
+    let idx = 0;
+    const tryNext = () => {
+      if (idx >= tryUrls.length) return reject(new Error('Failed to load ZXing from CDN'));
+      const url = tryUrls[idx++];
+      const s = document.createElement('script');
+      s.src = url;
+      s.async = true;
+      s.onload = () => {
+        // give the global a moment to attach
+        setTimeout(() => {
+          if (win.BrowserMultiFormatReader || win.ZXing || win.BrowserBarcodeReader) return resolve(win);
+          // try next URL if this one didn't expose expected globals
+          tryNext();
+        }, 50);
+      };
+      s.onerror = () => {
+        // try next CDN URL
+        tryNext();
+      };
+      document.head.appendChild(s);
+    };
+
+    tryNext();
+  });
+
+  const startWebcamScanner = async () => {
+    try {
+      const ZX = await loadZXing();
+      if (!videoRef.current) return;
+
+      // create a video element to attach camera stream
+      const videoEl = document.createElement('video');
+      videoEl.setAttribute('playsinline', 'true');
+      videoEl.style.width = '100%';
+      videoEl.style.height = '100%';
+      videoEl.style.objectFit = 'contain';
+      // clear container and append
+      videoRef.current.innerHTML = '';
+      videoRef.current.appendChild(videoEl);
+      zxingVideoElemRef.current = videoEl;
+
+      // BrowserMultiFormatReader (newer @zxing/browser) or BrowserMultiFormatReader in UMD
+      const win = (window as any);
+      const possibleReaders = [
+        (ZX as any).BrowserMultiFormatReader,
+        (ZX as any).BrowserCodeReader,
+        (ZX as any).BrowserMultiFormatContinuousReader,
+        (ZX as any).BrowserBarcodeReader,
+        (ZX as any).BrowserMultiFormatReader,
+        win.BrowserMultiFormatReader,
+        win.BrowserCodeReader,
+        win.BrowserBarcodeReader,
+        win.ZXing && win.ZXing.BrowserMultiFormatReader,
+        win.ZXing && win.ZXing.BrowserCodeReader,
+        win.ZXing && win.ZXing.BrowserBarcodeReader,
+      ];
+      const Reader = possibleReaders.find(r => typeof r === 'function');
+      if (!Reader) {
+        console.error('No ZXing reader found in loaded module', ZX);
+        alert('ZXing not available');
+        return;
+      }
+
+      const codeReader = new Reader();
+      zxingReaderRef.current = codeReader;
+
+      // Attempt to start video decode. Use decodeFromVideoDevice if available (UMD), else use decodeFromVideoElement.
+      if (typeof codeReader.listVideoInputDevices === 'function' || navigator.mediaDevices?.enumerateDevices) {
+        // prefer library API to list devices, otherwise use navigator.mediaDevices
+        let devices: any[] = [];
+        try {
+          if (typeof codeReader.listVideoInputDevices === 'function') devices = await codeReader.listVideoInputDevices();
+          else if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+            const devs = await navigator.mediaDevices.enumerateDevices();
+            devices = devs.filter(d => d.kind === 'videoinput').map(d => ({ deviceId: (d as any).deviceId, label: d.label }));
+          }
+        } catch (e) { console.warn('Device list error', e); }
+
+        if (!devices || devices.length === 0) {
+          alert('No camera devices found. Make sure a webcam is connected and allowed in browser permissions.');
+          return;
+        }
+
+        const deviceId = devices[0].deviceId;
+        if (typeof codeReader.decodeFromVideoDevice === 'function') {
+          try {
+            // Try to decode using the specific deviceId (preferred on multi-camera systems)
+            codeReader.decodeFromVideoDevice(deviceId, videoEl, (result: any, err: any) => {
+              if (result) {
+                const code = (result as any).getText ? (result as any).getText() : (result as any).text || result;
+                handleScanSubmit(String(code));
+                try { codeReader.reset(); } catch (e) {}
+                setShowWebcam(false);
+              }
+              // ignore intermittent decode errors
+            });
+            return;
+          } catch (err) {
+            console.warn('decodeFromVideoDevice failed', err);
+            // Fallback: try generic getUserMedia without deviceId (lets browser pick the default camera - works well on laptops)
+            try {
+              const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+              if (videoEl) {
+                videoEl.srcObject = stream;
+                await videoEl.play();
+                // Try decoding from the video element directly
+                if (typeof codeReader.decodeFromVideoElement === 'function') {
+                  codeReader.decodeFromVideoElement(videoEl).then((res: any) => {
+                    const code = res && (res.getText ? res.getText() : res.text || res);
+                    handleScanSubmit(String(code));
+                    try { codeReader.reset(); } catch (e) {}
+                    setShowWebcam(false);
+                  }).catch((e: any) => console.error('decodeFromVideoElement failed', e));
+                }
+              }
+              return;
+            } catch (e) {
+              console.warn('Fallback getUserMedia failed', e);
+            }
+          }
+        }
+      }
+
+      // fallback: try decodeFromVideoElement or decodeOnceFromVideoDevice
+      if (typeof codeReader.decodeFromVideoElement === 'function') {
+        try {
+          codeReader.decodeFromVideoElement(videoEl).then((res: any) => {
+            const code = res && (res.getText ? res.getText() : res.text || res);
+            handleScanSubmit(String(code));
+            try { codeReader.reset(); } catch (e) {}
+            setShowWebcam(false);
+          }).catch((err: any) => { console.error('decodeFromVideoElement err', err); });
+        } catch (e) { console.error(e); }
+      } else {
+        alert('ZXing reader does not support video decoding in this build.');
+      }
+    } catch (e) {
+      console.error('ZXing load/start failed', e);
+      alert('Unable to load camera scanner (ZXing). Check network or try again.');
+    }
+  };
+
+  const stopWebcamScanner = () => {
+    try {
+      const reader = zxingReaderRef.current;
+      if (reader) {
+        try { reader.reset(); } catch (e) { console.error(e); }
+        zxingReaderRef.current = null;
+      }
+      if (zxingVideoElemRef.current && zxingVideoElemRef.current.srcObject) {
+        const stream = zxingVideoElemRef.current.srcObject as MediaStream;
+        stream.getTracks().forEach(t => t.stop());
+        zxingVideoElemRef.current.srcObject = null as any;
+      }
+      if (videoRef.current) videoRef.current.innerHTML = '';
+    } catch (e) { console.error(e); }
+  };
+
   const handleAddToCart = (e: React.FormEvent) => {
     e.preventDefault();
     if (!selectedProduct || !formData.qty) return;
@@ -968,6 +1144,13 @@ const POSView = ({ products, onBulkSale, user }: any) => {
                       }
                     }}
                   />
+                  <button
+                    type="button"
+                    onClick={() => { setShowWebcam(true); setTimeout(() => startWebcamScanner(), 120); }}
+                    className="px-3 py-2 bg-white border border-slate-200 ml-2 rounded-xl text-slate-700 font-bold text-sm"
+                  >
+                    Use Camera
+                  </button>
                 </div>
                 {scanFeedback && (
                   <div className="mt-2 text-sm font-bold text-green-600">{scanFeedback}</div>
@@ -982,6 +1165,19 @@ const POSView = ({ products, onBulkSale, user }: any) => {
                   Auto-add 1 item on scan
                 </label>
               </div>
+              {/* Webcam scanner modal */}
+              {showWebcam && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+                  <div className="bg-white rounded-2xl w-full max-w-lg p-4">
+                    <div className="flex justify-between items-center mb-3">
+                      <h4 className="font-black">Camera Scanner</h4>
+                      <button onClick={() => { stopWebcamScanner(); setShowWebcam(false); }} className="text-slate-500 p-2 rounded-lg">Close</button>
+                    </div>
+                    <div ref={videoRef as any} style={{ width: '100%', height: '320px', background: '#000', borderRadius: 8, overflow: 'hidden' }} />
+                    <div className="mt-3 text-sm text-slate-500">Point your webcam at a barcode. The scanner will close automatically when a code is detected.</div>
+                  </div>
+                </div>
+              )}
 
               <div className="relative">
                 <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Product</label>
@@ -1317,8 +1513,8 @@ const DashboardView = ({ lowStockItems, totalSales, grossProfit, transactions, p
             <div><h4 className="font-black text-sm uppercase flex items-center gap-2"><BarChart3 size={16} className="text-blue-600" /> Sales Mix</h4></div>
           </div>
           <div className="space-y-5 sm:space-y-6">
-            {categorySales.map(([cat, val]) => (
-              <div key={cat}>
+            {categorySales.map(([cat, val], _idx) => (
+              <div key={`${cat}-${_idx}`}>
                 <div className="flex justify-between text-[10px] sm:text-[11px] font-black uppercase mb-2"><span className="text-slate-500">{cat}</span><span className="text-slate-900">{formatCurrency(val)}</span></div>
                 <div className="h-2 sm:h-3 w-full bg-slate-100 rounded-full overflow-hidden"><div className="h-full bg-blue-600 rounded-full transition-all duration-1000" style={{ width: `${(val / maxVal) * 100}%` }}></div></div>
               </div>
