@@ -874,6 +874,8 @@ const POSView = ({ products, onBulkSale, user }: any) => {
   // Webcam scanner using ZXing-js (loaded from CDN via dynamic import)
   const zxingReaderRef = useRef<any>(null);
   const zxingVideoElemRef = useRef<HTMLVideoElement | null>(null);
+  const recentScans = useRef<Record<string, number>>({});
+  const [scannedList, setScannedList] = useState<string[]>([]);
 
   const loadZXing = () => new Promise<any>((resolve, reject) => {
     // If ZXing UMD is already present, resolve immediately
@@ -971,14 +973,24 @@ const POSView = ({ products, onBulkSale, user }: any) => {
 
         const deviceId = devices[0].deviceId;
         if (typeof codeReader.decodeFromVideoDevice === 'function') {
-          try {
+            try {
             // Try to decode using the specific deviceId (preferred on multi-camera systems)
             codeReader.decodeFromVideoDevice(deviceId, videoEl, (result: any, err: any) => {
               if (result) {
                 const code = (result as any).getText ? (result as any).getText() : (result as any).text || result;
-                handleScanSubmit(String(code));
-                try { codeReader.reset(); } catch (e) {}
-                setShowWebcam(false);
+                // debounce duplicate rapid reads
+                try {
+                  const now = Date.now();
+                  const last = recentScans.current[String(code)] || 0;
+                  if (now - last > 1200) {
+                    recentScans.current[String(code)] = now;
+                    handleScanSubmit(String(code));
+                    setScanFeedback(`Scanned: ${String(code)}`);
+                    setScannedList(prev => [String(code), ...prev].slice(0, 10));
+                    setTimeout(() => setScanFeedback(''), 800);
+                  }
+                } catch (e) { console.error(e); }
+                // do NOT close the scanner — allow multiple scans
               }
               // ignore intermittent decode errors
             });
@@ -993,12 +1005,24 @@ const POSView = ({ products, onBulkSale, user }: any) => {
                 await videoEl.play();
                 // Try decoding from the video element directly
                 if (typeof codeReader.decodeFromVideoElement === 'function') {
-                  codeReader.decodeFromVideoElement(videoEl).then((res: any) => {
+                  // continuous decode: call decodeFromVideoElement and on success do not close
+                  const handleResult = (res: any) => {
                     const code = res && (res.getText ? res.getText() : res.text || res);
-                    handleScanSubmit(String(code));
-                    try { codeReader.reset(); } catch (e) {}
-                    setShowWebcam(false);
-                  }).catch((e: any) => console.error('decodeFromVideoElement failed', e));
+                    const now = Date.now();
+                    const last = recentScans.current[String(code)] || 0;
+                    if (now - last > 1200) {
+                      recentScans.current[String(code)] = now;
+                      handleScanSubmit(String(code));
+                      setScanFeedback(`Scanned: ${String(code)}`);
+                      setScannedList(prev => [String(code), ...prev].slice(0, 10));
+                      setTimeout(() => setScanFeedback(''), 800);
+                    }
+                    // continue listening by attempting decode again
+                    setTimeout(() => {
+                      try { codeReader.decodeFromVideoElement(videoEl).then(handleResult).catch(() => {}); } catch(e){}
+                    }, 300);
+                  };
+                  codeReader.decodeFromVideoElement(videoEl).then(handleResult).catch((e: any) => console.error('decodeFromVideoElement failed', e));
                 }
               }
               return;
@@ -1019,13 +1043,29 @@ const POSView = ({ products, onBulkSale, user }: any) => {
             setShowWebcam(false);
           }).catch((err: any) => { console.error('decodeFromVideoElement err', err); });
         } catch (e) { console.error(e); }
-      } else {
-        alert('ZXing reader does not support video decoding in this build.');
+        try {
+          // continuous decode loop
+          const handleResult = (res: any) => {
+            const code = res && (res.getText ? res.getText() : res.text || res);
+            const now = Date.now();
+            const last = recentScans.current[String(code)] || 0;
+            if (now - last > 1200) {
+              recentScans.current[String(code)] = now;
+              handleScanSubmit(String(code));
+              setScanFeedback(`Scanned: ${String(code)}`);
+              setScannedList(prev => [String(code), ...prev].slice(0, 10));
+              setTimeout(() => setScanFeedback(''), 800);
+            }
+            // attempt another decode after a short delay
+            setTimeout(() => {
+              try { codeReader.decodeFromVideoElement(videoEl).then(handleResult).catch(() => {}); } catch(e){}
+            }, 300);
+          };
+          codeReader.decodeFromVideoElement(videoEl).then(handleResult).catch((err: any) => { console.error('decodeFromVideoElement err', err); });
+        } catch (e) { console.error(e); }
       }
-    } catch (e) {
-      console.error('ZXing load/start failed', e);
-      alert('Unable to load camera scanner (ZXing). Check network or try again.');
-    }
+      if (videoRef.current) videoRef.current.innerHTML = '';
+    } catch (e) { console.error(e); }
   };
 
   const stopWebcamScanner = () => {
@@ -1174,7 +1214,16 @@ const POSView = ({ products, onBulkSale, user }: any) => {
                       <button onClick={() => { stopWebcamScanner(); setShowWebcam(false); }} className="text-slate-500 p-2 rounded-lg">Close</button>
                     </div>
                     <div ref={videoRef as any} style={{ width: '100%', height: '320px', background: '#000', borderRadius: 8, overflow: 'hidden' }} />
-                    <div className="mt-3 text-sm text-slate-500">Point your webcam at a barcode. The scanner will close automatically when a code is detected.</div>
+                    <div className="mt-3 text-sm text-slate-500">Scan multiple items. Press Close when finished.</div>
+                    {scannedList.length > 0 && (
+                      <div className="mt-3">
+                        <div className="text-[11px] font-bold mb-1">Recent scans</div>
+                        <div className="flex flex-col gap-1 max-h-28 overflow-auto text-sm">
+                          {scannedList.map((s, i) => (<div key={`sc-${i}`} className="px-2 py-1 bg-slate-50 rounded-md font-mono text-[13px]">{s}</div>))}
+                        </div>
+                        <div className="mt-2"><button onClick={() => setScannedList([])} className="px-3 py-1 text-sm bg-slate-100 rounded-md">Clear</button></div>
+                      </div>
+                    )}
                   </div>
                 </div>
               )}
