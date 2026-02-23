@@ -737,9 +737,8 @@ const POSView = ({ products, onBulkSale, user }: any) => {
   const scannerTimer = useRef<number | null>(null);
   const [scanFeedback, setScanFeedback] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
-  const [showWebcam, setShowWebcam] = useState(false);
-  const videoRef = useRef<HTMLDivElement | null>(null);
-  const quaggaOnDetectedRef = useRef<any>(null);
+  // recentScans is used to de-duplicate rapid consecutive scans (keyboard or camera)
+  const recentScans = useRef<Record<string, number>>({});
   const [showReceipt, setShowReceipt] = useState(false);
   const [receiptData, setReceiptData] = useState<any>(null);
   // Default to false to avoid unexpected print popups on sale completion
@@ -841,7 +840,34 @@ const POSView = ({ products, onBulkSale, user }: any) => {
     });
   };
 
-  const handleScanSubmit = (code: string) => {
+  // Parse scan input with optional quantity prefix. Examples: "3*SKU123", "2SKU123", "5 x SKU"
+  const parseScanInput = (input: string) => {
+    const raw = (input || '').trim();
+    const prefixMatch = raw.match(/^\s*(\d+)\s*[\*xX]?\s*(.+)$/);
+    if (prefixMatch) {
+      const qty = parseInt(prefixMatch[1], 10) || 1;
+      const code = prefixMatch[2].trim();
+      return { qty, code };
+    }
+    return { qty: 1, code: raw };
+  };
+
+  const handleScanSubmit = (inputRaw: string) => {
+    const { qty, code } = parseScanInput(inputRaw);
+    if (!code) return;
+
+    // de-duplicate rapid repeated scans (1200ms window)
+    try {
+      const now = Date.now();
+      const last = recentScans.current[String(code)] || 0;
+      if (now - last < 1200) {
+        setScanFeedback(`Ignored duplicate: ${code}`);
+        setTimeout(() => setScanFeedback(''), 800);
+        return;
+      }
+      recentScans.current[String(code)] = now;
+    } catch (e) { /* ignore */ }
+
     const p = findProductByBarcode(code);
     if (!p) {
       alert(`No product found for barcode/SKU: ${code}`);
@@ -857,232 +883,24 @@ const POSView = ({ products, onBulkSale, user }: any) => {
     }
 
     if (autoAddOnScan) {
-      // Add qty=1 per scan
-      addOrIncrementCartItem(p, 1);
+      addOrIncrementCartItem(p, qty);
       // keep the selection form clean
       setFormData(prev => ({ ...prev, productId: '', qty: '', unitPrice: '', method: prev.method }));
       setProductQuery('');
       setShowSuggestions(false);
+      setScanFeedback(`Scanned: ${qty} x ${p.name}`);
+      setTimeout(() => setScanFeedback(''), 1000);
     } else {
-      // Just select the product in the form (user enters qty & rate)
-      setFormData(prev => ({ ...prev, productId: p.id, unitPrice: p.sellingPrice }));
+      // Select the product in the form and prefill qty & rate
+      setFormData(prev => ({ ...prev, productId: p.id, qty: String(qty), unitPrice: p.sellingPrice }));
       setProductQuery(p.name);
       setShowSuggestions(false);
+      setScanFeedback(`Selected: ${qty} x ${p.name}`);
+      setTimeout(() => setScanFeedback(''), 1000);
     }
   };
 
-  // Webcam scanner using ZXing-js (loaded from CDN via dynamic import)
-  const zxingReaderRef = useRef<any>(null);
-  const zxingVideoElemRef = useRef<HTMLVideoElement | null>(null);
-  const recentScans = useRef<Record<string, number>>({});
-  const [scannedList, setScannedList] = useState<string[]>([]);
-
-  const loadZXing = () => new Promise<any>((resolve, reject) => {
-    // If ZXing UMD is already present, resolve immediately
-    const win = (window as any);
-    if (win.BrowserMultiFormatReader || win.ZXing || win.BrowserBarcodeReader) return resolve(win);
-    const tryUrls = [
-      'https://unpkg.com/@zxing/library@0.18.6/umd/index.min.js',
-      'https://unpkg.com/@zxing/library/umd/index.min.js',
-      'https://cdn.jsdelivr.net/npm/@zxing/library@0.18.6/umd/index.min.js',
-      'https://cdn.jsdelivr.net/npm/@zxing/library/umd/index.min.js'
-    ];
-
-    let idx = 0;
-    const tryNext = () => {
-      if (idx >= tryUrls.length) return reject(new Error('Failed to load ZXing from CDN'));
-      const url = tryUrls[idx++];
-      const s = document.createElement('script');
-      s.src = url;
-      s.async = true;
-      s.onload = () => {
-        // give the global a moment to attach
-        setTimeout(() => {
-          if (win.BrowserMultiFormatReader || win.ZXing || win.BrowserBarcodeReader) return resolve(win);
-          // try next URL if this one didn't expose expected globals
-          tryNext();
-        }, 50);
-      };
-      s.onerror = () => {
-        // try next CDN URL
-        tryNext();
-      };
-      document.head.appendChild(s);
-    };
-
-    tryNext();
-  });
-
-  const startWebcamScanner = async () => {
-    try {
-      const ZX = await loadZXing();
-      if (!videoRef.current) return;
-
-      // create a video element to attach camera stream
-      const videoEl = document.createElement('video');
-      videoEl.setAttribute('playsinline', 'true');
-      videoEl.style.width = '100%';
-      videoEl.style.height = '100%';
-      videoEl.style.objectFit = 'contain';
-      // clear container and append
-      videoRef.current.innerHTML = '';
-      videoRef.current.appendChild(videoEl);
-      zxingVideoElemRef.current = videoEl;
-
-      // BrowserMultiFormatReader (newer @zxing/browser) or BrowserMultiFormatReader in UMD
-      const win = (window as any);
-      const possibleReaders = [
-        (ZX as any).BrowserMultiFormatReader,
-        (ZX as any).BrowserCodeReader,
-        (ZX as any).BrowserMultiFormatContinuousReader,
-        (ZX as any).BrowserBarcodeReader,
-        (ZX as any).BrowserMultiFormatReader,
-        win.BrowserMultiFormatReader,
-        win.BrowserCodeReader,
-        win.BrowserBarcodeReader,
-        win.ZXing && win.ZXing.BrowserMultiFormatReader,
-        win.ZXing && win.ZXing.BrowserCodeReader,
-        win.ZXing && win.ZXing.BrowserBarcodeReader,
-      ];
-      const Reader = possibleReaders.find(r => typeof r === 'function');
-      if (!Reader) {
-        console.error('No ZXing reader found in loaded module', ZX);
-        alert('ZXing not available');
-        return;
-      }
-
-      const codeReader = new Reader();
-      zxingReaderRef.current = codeReader;
-
-      // Attempt to start video decode. Use decodeFromVideoDevice if available (UMD), else use decodeFromVideoElement.
-      if (typeof codeReader.listVideoInputDevices === 'function' || navigator.mediaDevices?.enumerateDevices) {
-        // prefer library API to list devices, otherwise use navigator.mediaDevices
-        let devices: any[] = [];
-        try {
-          if (typeof codeReader.listVideoInputDevices === 'function') devices = await codeReader.listVideoInputDevices();
-          else if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
-            const devs = await navigator.mediaDevices.enumerateDevices();
-            devices = devs.filter(d => d.kind === 'videoinput').map(d => ({ deviceId: (d as any).deviceId, label: d.label }));
-          }
-        } catch (e) { console.warn('Device list error', e); }
-
-        if (!devices || devices.length === 0) {
-          alert('No camera devices found. Make sure a webcam is connected and allowed in browser permissions.');
-          return;
-        }
-
-        const deviceId = devices[0].deviceId;
-        if (typeof codeReader.decodeFromVideoDevice === 'function') {
-            try {
-            // Try to decode using the specific deviceId (preferred on multi-camera systems)
-            codeReader.decodeFromVideoDevice(deviceId, videoEl, (result: any, err: any) => {
-              if (result) {
-                const code = (result as any).getText ? (result as any).getText() : (result as any).text || result;
-                // debounce duplicate rapid reads
-                try {
-                  const now = Date.now();
-                  const last = recentScans.current[String(code)] || 0;
-                  if (now - last > 1200) {
-                    recentScans.current[String(code)] = now;
-                    handleScanSubmit(String(code));
-                    setScanFeedback(`Scanned: ${String(code)}`);
-                    setScannedList(prev => [String(code), ...prev].slice(0, 10));
-                    setTimeout(() => setScanFeedback(''), 800);
-                  }
-                } catch (e) { console.error(e); }
-                // do NOT close the scanner — allow multiple scans
-              }
-              // ignore intermittent decode errors
-            });
-            return;
-          } catch (err) {
-            console.warn('decodeFromVideoDevice failed', err);
-            // Fallback: try generic getUserMedia without deviceId (lets browser pick the default camera - works well on laptops)
-            try {
-              const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-              if (videoEl) {
-                videoEl.srcObject = stream;
-                await videoEl.play();
-                // Try decoding from the video element directly
-                if (typeof codeReader.decodeFromVideoElement === 'function') {
-                  // continuous decode: call decodeFromVideoElement and on success do not close
-                  const handleResult = (res: any) => {
-                    const code = res && (res.getText ? res.getText() : res.text || res);
-                    const now = Date.now();
-                    const last = recentScans.current[String(code)] || 0;
-                    if (now - last > 1200) {
-                      recentScans.current[String(code)] = now;
-                      handleScanSubmit(String(code));
-                      setScanFeedback(`Scanned: ${String(code)}`);
-                      setScannedList(prev => [String(code), ...prev].slice(0, 10));
-                      setTimeout(() => setScanFeedback(''), 800);
-                    }
-                    // continue listening by attempting decode again
-                    setTimeout(() => {
-                      try { codeReader.decodeFromVideoElement(videoEl).then(handleResult).catch(() => {}); } catch(e){}
-                    }, 300);
-                  };
-                  codeReader.decodeFromVideoElement(videoEl).then(handleResult).catch((e: any) => console.error('decodeFromVideoElement failed', e));
-                }
-              }
-              return;
-            } catch (e) {
-              console.warn('Fallback getUserMedia failed', e);
-            }
-          }
-        }
-      }
-
-      // fallback: try decodeFromVideoElement or decodeOnceFromVideoDevice
-      if (typeof codeReader.decodeFromVideoElement === 'function') {
-        try {
-          codeReader.decodeFromVideoElement(videoEl).then((res: any) => {
-            const code = res && (res.getText ? res.getText() : res.text || res);
-            handleScanSubmit(String(code));
-            try { codeReader.reset(); } catch (e) {}
-            setShowWebcam(false);
-          }).catch((err: any) => { console.error('decodeFromVideoElement err', err); });
-        } catch (e) { console.error(e); }
-        try {
-          // continuous decode loop
-          const handleResult = (res: any) => {
-            const code = res && (res.getText ? res.getText() : res.text || res);
-            const now = Date.now();
-            const last = recentScans.current[String(code)] || 0;
-            if (now - last > 1200) {
-              recentScans.current[String(code)] = now;
-              handleScanSubmit(String(code));
-              setScanFeedback(`Scanned: ${String(code)}`);
-              setScannedList(prev => [String(code), ...prev].slice(0, 10));
-              setTimeout(() => setScanFeedback(''), 800);
-            }
-            // attempt another decode after a short delay
-            setTimeout(() => {
-              try { codeReader.decodeFromVideoElement(videoEl).then(handleResult).catch(() => {}); } catch(e){}
-            }, 300);
-          };
-          codeReader.decodeFromVideoElement(videoEl).then(handleResult).catch((err: any) => { console.error('decodeFromVideoElement err', err); });
-        } catch (e) { console.error(e); }
-      }
-      if (videoRef.current) videoRef.current.innerHTML = '';
-    } catch (e) { console.error(e); }
-  };
-
-  const stopWebcamScanner = () => {
-    try {
-      const reader = zxingReaderRef.current;
-      if (reader) {
-        try { reader.reset(); } catch (e) { console.error(e); }
-        zxingReaderRef.current = null;
-      }
-      if (zxingVideoElemRef.current && zxingVideoElemRef.current.srcObject) {
-        const stream = zxingVideoElemRef.current.srcObject as MediaStream;
-        stream.getTracks().forEach(t => t.stop());
-        zxingVideoElemRef.current.srcObject = null as any;
-      }
-      if (videoRef.current) videoRef.current.innerHTML = '';
-    } catch (e) { console.error(e); }
-  };
+  
 
   const handleAddToCart = (e: React.FormEvent) => {
     e.preventDefault();
@@ -1164,12 +982,12 @@ const POSView = ({ products, onBulkSale, user }: any) => {
                   <QrCode size={18} />
                   Tap to Scan
                 </button>
-                <div className="flex gap-2">
+                <div>
                   <input
                     ref={scanRef}
                     type="text"
                     inputMode="none"
-                    className="flex-1 p-3 sm:p-4 bg-slate-50 border border-slate-200 rounded-xl sm:rounded-2xl font-bold outline-none focus:ring-4 focus:ring-blue-100 transition-all text-sm font-mono"
+                    className="w-full p-3 sm:p-4 bg-slate-50 border border-slate-200 rounded-xl sm:rounded-2xl font-bold outline-none focus:ring-4 focus:ring-blue-100 transition-all text-sm font-mono"
                     placeholder="(Focused) Scan barcode / SKU…"
                     value={scanValue}
                     onChange={(e) => setScanValue(e.target.value)}
@@ -1184,13 +1002,6 @@ const POSView = ({ products, onBulkSale, user }: any) => {
                       }
                     }}
                   />
-                  <button
-                    type="button"
-                    onClick={() => { setShowWebcam(true); setTimeout(() => startWebcamScanner(), 120); }}
-                    className="px-3 py-2 bg-white border border-slate-200 ml-2 rounded-xl text-slate-700 font-bold text-sm"
-                  >
-                    Use Camera
-                  </button>
                 </div>
                 {scanFeedback && (
                   <div className="mt-2 text-sm font-bold text-green-600">{scanFeedback}</div>
@@ -1205,28 +1016,7 @@ const POSView = ({ products, onBulkSale, user }: any) => {
                   Auto-add 1 item on scan
                 </label>
               </div>
-              {/* Webcam scanner modal */}
-              {showWebcam && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-                  <div className="bg-white rounded-2xl w-full max-w-lg p-4">
-                    <div className="flex justify-between items-center mb-3">
-                      <h4 className="font-black">Camera Scanner</h4>
-                      <button onClick={() => { stopWebcamScanner(); setShowWebcam(false); }} className="text-slate-500 p-2 rounded-lg">Close</button>
-                    </div>
-                    <div ref={videoRef as any} style={{ width: '100%', height: '320px', background: '#000', borderRadius: 8, overflow: 'hidden' }} />
-                    <div className="mt-3 text-sm text-slate-500">Scan multiple items. Press Close when finished.</div>
-                    {scannedList.length > 0 && (
-                      <div className="mt-3">
-                        <div className="text-[11px] font-bold mb-1">Recent scans</div>
-                        <div className="flex flex-col gap-1 max-h-28 overflow-auto text-sm">
-                          {scannedList.map((s, i) => (<div key={`sc-${i}`} className="px-2 py-1 bg-slate-50 rounded-md font-mono text-[13px]">{s}</div>))}
-                        </div>
-                        <div className="mt-2"><button onClick={() => setScannedList([])} className="px-3 py-1 text-sm bg-slate-100 rounded-md">Clear</button></div>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )}
+              {/* Camera scanner removed */}
 
               <div className="relative">
                 <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Product</label>
@@ -1683,7 +1473,7 @@ const InventoryView = ({ products, onAdd, onEdit }: any) => {
             </div>
             <div style="flex:1;min-width:0;padding-left:6px;">
               <div style="font-weight:700;font-size:14px;color:#111;background:#fff;padding:2px 0;">${escapeHtml(p.name)}</div>
-              <div style="font-family:monospace;font-size:12px;color:#333;margin-top:6px;background:#fff;padding:2px 0">SKU: ${escapeHtml(p.id)}</div>
+        <div style="font-family:monospace;font-size:12px;color:#333;margin-top:6px;background:#fff;padding:2px 0">Price: ${escapeHtml(formatCurrency(p.sellingPrice))}</div>
             </div>
           </div>
         </div>`;
