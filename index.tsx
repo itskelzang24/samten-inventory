@@ -128,6 +128,9 @@ type Transaction = {
 type CartItem = {
   id: string;
   productId: string;
+  // Optional identifiers to ensure barcode-scan and smart-search add merge consistently
+  barcode?: string;
+  sku?: string;
   name: string;
   qty: number;
   unitPrice: number;
@@ -181,8 +184,9 @@ const downloadCSV = (data: any[], filename: string, headers: string[]) => {
 
 // Generate a scannable Code128 SVG using JsBarcode (preferred).
 const generateBarcodeSvg = (text: string, opts: { height?: number, width?: number, margin?: number } = {}) => {
-  const height = opts.height ?? 60;
-  const width = opts.width ?? 2;
+  // make the default a bit smaller so exported labels are not oversized
+  const height = opts.height ?? 48;
+  const width = opts.width ?? 1.4;
   const margin = opts.margin ?? 0;
   try {
     // create SVG element and render Code128 barcode into it
@@ -232,7 +236,7 @@ const printLabel = (p: Product) => {
   try {
     const win = window.open('', '_blank', 'width=320,height=400');
     if (!win) return;
-  const svg = p.barcodeSvg || generateBarcodeSvg(p.id, { height: 60, width: 2 });
+  const svg = p.barcodeSvg || generateBarcodeSvg(p.id, { height: 48, width: 1.4 });
     const escaped = svg.replace(/</g, '\u003c');
     const html = `<!doctype html><html><head><meta charset="utf-8"><title>Label ${p.id}</title><style>body{font-family:Arial,sans-serif;padding:8px;} .box{width:300px}</style></head><body><div class="box"><div>${escaped}</div><div style="margin-top:8px;font-weight:bold">${p.name}</div><div style="font-size:12px;color:#555">SKU: ${p.id}</div></div></body></html>`;
     win.document.write(html);
@@ -730,11 +734,13 @@ const POSView = ({ products, onBulkSale, user }: any) => {
   const [showSuggestions, setShowSuggestions] = useState(false);
 
   // Barcode scanner (USB scanners usually behave like a keyboard + Enter)
-  const [scanValue, setScanValue] = useState('');
   const [autoAddOnScan, setAutoAddOnScan] = useState(true);
-  const scanRef = useRef<HTMLInputElement | null>(null);
   const scannerBuffer = useRef('');
   const scannerTimer = useRef<number | null>(null);
+  const scannerFirst = useRef<number>(0);
+  const lastKeyTime = useRef<number>(0);
+  const scannerMode = useRef<boolean>(false);
+  const scannerModeTimer = useRef<number | null>(null);
   const [scanFeedback, setScanFeedback] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
   // recentScans is used to de-duplicate rapid consecutive scans (keyboard or camera)
@@ -776,33 +782,78 @@ const POSView = ({ products, onBulkSale, user }: any) => {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       try {
-        const active = document.activeElement as Element | null;
-        const tag = active && (active.tagName || '').toLowerCase();
-        // If user is typing into an input/textarea (except our hidden/scan input), don't intercept
-        if (active && (tag === 'input' || tag === 'textarea' || (active as HTMLElement).isContentEditable)) {
-          if (scanRef.current && active === scanRef.current) {
-            // allow the focused scan input to handle Enter via its onKeyDown
-          } else {
-            return;
-          }
-        }
+        // Sanitize and time keystrokes to detect scanner input vs manual typing.
+        const now = Date.now();
+        const delta = lastKeyTime.current ? (now - lastKeyTime.current) : Infinity;
+        lastKeyTime.current = now;
 
         if (e.key === 'Enter') {
-          const code = scannerBuffer.current.trim();
+          const raw = scannerBuffer.current;
+          const code = String(raw || '').trim();
+          const first = scannerFirst.current || now;
+          const len = code.length;
+          // If buffer is empty (first-scan race), try reading the currently focused input value
+          let finalCode = code;
+          try {
+            if (!finalCode) {
+              const active = document.activeElement as HTMLInputElement | null;
+              if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) {
+                const v = String((active as HTMLInputElement).value || '').trim();
+                // treat as scanner if recent keystrokes were fast or the input has a long value
+                if (v && ((now - lastKeyTime.current) < 900 || v.length >= 6)) {
+                  finalCode = v;
+                  // clear the input to avoid flicker
+                  try { (active as HTMLInputElement).value = ''; } catch (e) { /* ignore */ }
+                }
+              }
+            }
+          } catch (err) { /* ignore */ }
+          // reset buffer
           scannerBuffer.current = '';
-          if (code) {
-            handleScanSubmit(code);
-            setScanFeedback(`Scanned: ${code}`);
-            window.setTimeout(() => setScanFeedback(''), 1200);
+          scannerFirst.current = 0;
+          if (scannerTimer.current) { window.clearTimeout(scannerTimer.current); scannerTimer.current = null; }
+          if (scannerModeTimer.current) { window.clearTimeout(scannerModeTimer.current); scannerModeTimer.current = null; }
+          const wasScanner = scannerMode.current;
+          scannerMode.current = false;
+
+          if (!finalCode) return;
+
+          // average inter-key interval (ms)
+          const useLen = finalCode.length;
+          const avg = useLen > 1 ? (now - first) / (useLen - 1) : Infinity;
+
+          // treat as scanner when typing is fast (avg < 120ms) or code is long
+          if (avg < 120 || useLen >= 8 || wasScanner) {
+            // sanitize code: remove control / non-printable characters commonly emitted
+            const sanitized = String(finalCode).replace(/[^0-9A-Za-z\-_.]/g, '');
+            handleScanSubmit(sanitized);
+            setScanFeedback(`Scanned: ${sanitized}`);
+            window.setTimeout(() => setScanFeedback(''), 900);
+          } else {
+            // likely manual typing — do nothing here to avoid interfering with normal inputs
           }
           return;
         }
 
         // Only collect printable single characters
         if (e.key.length === 1) {
-          scannerBuffer.current += e.key;
-          if (scannerTimer.current) window.clearTimeout(scannerTimer.current);
-          scannerTimer.current = window.setTimeout(() => { scannerBuffer.current = ''; scannerTimer.current = null; }, 150);
+          // If keys are coming very fast (delta small) we assume a scanner and prevent them
+          // from reaching focused inputs to avoid flicker. This also starts the internal buffer.
+          const fastKey = delta < 90 || scannerMode.current;
+          if (fastKey) {
+            // mark scanner mode
+            scannerMode.current = true;
+            e.preventDefault();
+            if (!scannerBuffer.current) scannerFirst.current = now;
+            scannerBuffer.current += e.key;
+            if (scannerTimer.current) window.clearTimeout(scannerTimer.current);
+            scannerTimer.current = window.setTimeout(() => { scannerBuffer.current = ''; scannerTimer.current = null; scannerFirst.current = 0; }, 600);
+            if (scannerModeTimer.current) window.clearTimeout(scannerModeTimer.current);
+            scannerModeTimer.current = window.setTimeout(() => { scannerMode.current = false; scannerModeTimer.current = null; }, 700);
+          } else {
+            // treat as normal typing — let event propagate and clear any building buffer
+            // (do NOT append to scannerBuffer to avoid false positives)
+          }
         }
       } catch (err) {
         // ignore
@@ -815,32 +866,68 @@ const POSView = ({ products, onBulkSale, user }: any) => {
     };
   }, []);
 
-  const addOrIncrementCartItem = (p: any, qtyToAdd: number) => {
-    setCart(prev => {
-      const idx = prev.findIndex(i => i.productId === p.id);
-      if (idx >= 0) {
-        const next = [...prev];
-        const existing = next[idx];
-        const newQty = existing.qty + qtyToAdd;
-        next[idx] = { ...existing, qty: newQty, total: newQty * existing.unitPrice };
-        return next;
-      }
-      const unitPrice = Number(p.sellingPrice) || 0;
-      return [
-        ...prev,
-        {
-          id: Math.random().toString(36).substr(2, 9),
-          productId: p.id,
-          name: p.name,
-          qty: qtyToAdd,
-          unitPrice,
-          total: qtyToAdd * unitPrice
-        }
-      ];
-    });
-  };
+  const addOrIncrementCartItem = (p: any, qtyToAdd: number, unitPriceOverride?: number) => {
+  const normalize = (v: any) => String(v ?? '').toLowerCase().replace(/[^0-9a-z]/gi, '');
+  const pId = p?.id ?? p?.productId ?? '';
+  const pBarcode = p?.barcode ?? p?.code ?? '';
+  const pSku = p?.sku ?? p?.SKU ?? '';
+  const pName = p?.name ?? '';
 
-  // Parse scan input with optional quantity prefix. Examples: "3*SKU123", "2SKU123", "5 x SKU"
+  const pKeys = [pId, pBarcode, pSku].map(normalize).filter(Boolean);
+  const pNameKey = normalize(pName);
+
+  setCart(prev => {
+    const idx = prev.findIndex((i) => {
+      const iKeys = [i.productId, i.barcode, i.sku].map(normalize).filter(Boolean);
+      // Match by any stable identifier first
+      if (pKeys.length && iKeys.length) {
+        for (const k of pKeys) if (iKeys.includes(k)) return true;
+      }
+      // Fallback: same normalized name (prevents duplicates when IDs differ but it's truly the same item)
+      return Boolean(pNameKey) && normalize(i.name) === pNameKey;
+    });
+
+    if (idx >= 0) {
+      const next = [...prev];
+      const existing = next[idx];
+      const newQty = (existing.qty || 0) + qtyToAdd;
+      const price = typeof unitPriceOverride === 'number' ? unitPriceOverride : existing.unitPrice;
+
+      next[idx] = {
+        ...existing,
+        // backfill identifiers if they were missing when first added
+        productId: existing.productId || String(pId || ''),
+        barcode: existing.barcode || (pBarcode ? String(pBarcode) : undefined),
+        sku: existing.sku || (pSku ? String(pSku) : undefined),
+        qty: newQty,
+        unitPrice: price,
+        total: newQty * price
+      };
+      return next;
+    }
+
+    const unitPrice =
+      typeof unitPriceOverride === 'number'
+        ? unitPriceOverride
+        : Number(p?.sellingPrice ?? p?.unitPrice ?? p?.price ?? 0) || 0;
+
+    return [
+      ...prev,
+      {
+        id: Math.random().toString(36).substr(2, 9),
+        productId: String(pId || ''),
+        barcode: pBarcode ? String(pBarcode) : undefined,
+        sku: pSku ? String(pSku) : undefined,
+        name: String(pName || ''),
+        qty: qtyToAdd,
+        unitPrice,
+        total: qtyToAdd * unitPrice
+      }
+    ];
+  });
+};
+
+// Parse scan input with optional quantity prefix. Examples: "3*SKU123", "2SKU123", "5 x SKU"
   const parseScanInput = (input: string) => {
     const raw = (input || '').trim();
     const prefixMatch = raw.match(/^\s*(\d+)\s*[\*xX]?\s*(.+)$/);
@@ -870,15 +957,18 @@ const POSView = ({ products, onBulkSale, user }: any) => {
 
     const p = findProductByBarcode(code);
     if (!p) {
-      alert(`No product found for barcode/SKU: ${code}`);
+      setScanFeedback(`No product found: ${code}`);
+      setTimeout(() => setScanFeedback(''), 1600);
       return;
     }
     if (p.status !== 'Active') {
-      alert(`Product is inactive: ${p.name}`);
+      setScanFeedback(`Inactive product: ${p.name}`);
+      setTimeout(() => setScanFeedback(''), 1600);
       return;
     }
     if (p.currentStock <= 0) {
-      alert(`Out of stock: ${p.name}`);
+      setScanFeedback(`Out of stock: ${p.name}`);
+      setTimeout(() => setScanFeedback(''), 1600);
       return;
     }
 
@@ -903,29 +993,102 @@ const POSView = ({ products, onBulkSale, user }: any) => {
   
 
   const handleAddToCart = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!selectedProduct || !formData.qty) return;
-    
-    const qty = parseInt(formData.qty);
-    if (qty > selectedProduct.currentStock) {
-      alert(`Only ${selectedProduct.currentStock} units available in stock!`);
-      return;
-    }
+  e.preventDefault();
+  if (!selectedProduct || !formData.qty) return;
 
-    const newItem: CartItem = {
-      id: Math.random().toString(36).substr(2, 9),
-      productId: selectedProduct.id,
-      name: selectedProduct.name,
-      qty: qty,
-      unitPrice: parseFloat(formData.unitPrice),
-      total: qty * parseFloat(formData.unitPrice)
-    };
+  const qty = parseInt(formData.qty);
+  if (qty > selectedProduct.currentStock) {
+    setScanFeedback(`Only ${selectedProduct.currentStock} units available in stock!`);
+    setTimeout(() => setScanFeedback(''), 1600);
+    return;
+  }
 
-    setCart(prev => [...prev, newItem]);
-    setFormData({ ...formData, productId: '', qty: '', unitPrice: '' });
-  };
+  const price = parseFloat(formData.unitPrice);
+  addOrIncrementCartItem(selectedProduct, qty, isNaN(price) ? undefined : price);
+
+  setFormData({ ...formData, productId: '', qty: '', unitPrice: '' });
+  setProductQuery('');
+  setShowSuggestions(false);
+};
 
   const removeFromCart = (id: string) => setCart(prev => prev.filter(item => item.id !== id));
+
+  // Update quantity for an item (if newQty <= 0 the item is removed)
+  const updateCartItemQty = (id: string, newQty: number) => {
+    setCart(prev => {
+      const idx = prev.findIndex(i => i.id === id);
+      if (idx < 0) return prev;
+      if (newQty <= 0) {
+        // remove item
+        return prev.filter(i => i.id !== id);
+      }
+      const next = [...prev];
+      const it = next[idx];
+      const updated = { ...it, qty: newQty, total: newQty * it.unitPrice };
+      next[idx] = updated;
+      return next;
+    });
+  };
+
+  const incrementQty = (id: string) => {
+    const it = cart.find(c => c.id === id);
+    if (!it) return;
+    const p = products.find((pp: any) => pp.id === it.productId);
+    if (p && it.qty + 1 > p.currentStock) {
+      setScanFeedback(`Cannot increase. Only ${p.currentStock} units available in stock.`);
+      setTimeout(() => setScanFeedback(''), 1600);
+      return;
+    }
+    updateCartItemQty(id, it.qty + 1);
+  };
+
+  const decrementQty = (id: string) => {
+    const it = cart.find(c => c.id === id);
+    if (!it) return;
+    // If qty is 1, removing would clear the line — confirm with user
+    if (it.qty <= 1) {
+      if (confirm('Quantity is 1 — remove item from bill?')) {
+        removeFromCart(id);
+      }
+      return;
+    }
+    updateCartItemQty(id, it.qty - 1);
+  };
+
+  const editQty = (id: string) => {
+    const it = cart.find(c => c.id === id);
+    if (!it) return;
+    const val = prompt('Enter new quantity', String(it.qty));
+    if (val === null) return; // cancelled
+    const n = parseInt(val, 10);
+    if (isNaN(n) || n < 0) { alert('Invalid quantity'); return; }
+    const p = products.find((pp: any) => pp.id === it.productId);
+    if (p && n > p.currentStock) { alert(`Only ${p.currentStock} units available.`); return; }
+    updateCartItemQty(id, n);
+  };
+
+  // Update unit price for a cart item
+  const updateCartItemPrice = (id: string, newPrice: number) => {
+    setCart(prev => {
+      const idx = prev.findIndex(i => i.id === id);
+      if (idx < 0) return prev;
+      const next = [...prev];
+      const it = next[idx];
+      const price = Math.max(0, Number(newPrice) || 0);
+      next[idx] = { ...it, unitPrice: price, total: price * it.qty };
+      return next;
+    });
+  };
+
+  const editPrice = (id: string) => {
+    const it = cart.find(c => c.id === id);
+    if (!it) return;
+    const val = prompt('Enter new unit price (Nu.)', String(it.unitPrice));
+    if (val === null) return;
+    const n = parseFloat(val);
+    if (isNaN(n) || n < 0) { alert('Invalid price'); return; }
+    updateCartItemPrice(id, n);
+  };
 
   const subtotal = cart.reduce((sum, item) => sum + item.total, 0);
   const gstAmount = subtotal * 0.05;
@@ -968,41 +1131,8 @@ const POSView = ({ products, onBulkSale, user }: any) => {
             <form onSubmit={handleAddToCart} className="space-y-4 sm:space-y-5">
               <div>
                 <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Scan barcode / SKU</label>
-                {/* Big touch-friendly button to focus the scanner input (useful for USB scanners and touchscreens) */}
-                <button
-                  type="button"
-                  onClick={() => {
-                    setScanValue('');
-                    // Focus must happen after click; setTimeout ensures it lands reliably
-                    setTimeout(() => scanRef.current?.focus(), 0);
-                  }}
-                  className="w-full mb-2 p-3 sm:p-4 rounded-xl sm:rounded-2xl bg-slate-900 text-white font-black flex items-center justify-center gap-2 hover:bg-slate-800 active:scale-[0.99] transition"
-                  title="Tap here, then scan the barcode"
-                >
-                  <QrCode size={18} />
-                  Tap to Scan
-                </button>
-                <div>
-                  <input
-                    ref={scanRef}
-                    type="text"
-                    inputMode="none"
-                    className="w-full p-3 sm:p-4 bg-slate-50 border border-slate-200 rounded-xl sm:rounded-2xl font-bold outline-none focus:ring-4 focus:ring-blue-100 transition-all text-sm font-mono"
-                    placeholder="(Focused) Scan barcode / SKU…"
-                    value={scanValue}
-                    onChange={(e) => setScanValue(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') {
-                        e.preventDefault();
-                        const code = scanValue.trim();
-                        setScanValue('');
-                        if (code) handleScanSubmit(code);
-                        // keep focus so repeated scans are fast
-                        setTimeout(() => scanRef.current?.focus(), 0);
-                      }
-                    }}
-                  />
-                </div>
+                {/* Barcode scanning is handled globally by the keyboard-wedge listener. */}
+                <div className="mb-2 text-[12px] text-slate-500">Use a USB/keyboard scanner — items will be added automatically when scanned.</div>
                 {scanFeedback && (
                   <div className="mt-2 text-sm font-bold text-green-600">{scanFeedback}</div>
                 )}
@@ -1097,6 +1227,7 @@ const POSView = ({ products, onBulkSale, user }: any) => {
                   <tr>
                     <th className="px-4 py-3 sm:px-10 sm:py-5">Item</th>
                     <th className="px-4 py-3 sm:px-6 sm:py-5 text-center">Qty</th>
+                    <th className="px-4 py-3 sm:px-8 sm:py-5 text-right">Price</th>
                     <th className="px-4 py-3 sm:px-10 sm:py-5 text-right">Total</th>
                     <th className="px-4 py-3 sm:px-10 sm:py-5 text-center">Action</th>
                   </tr>
@@ -1106,14 +1237,30 @@ const POSView = ({ products, onBulkSale, user }: any) => {
                     <tr key={item.id} className="hover:bg-slate-50 transition-colors group">
                       <td className="px-4 py-3 sm:px-10 sm:py-5">
                         <p className="font-black text-slate-900 text-sm">{item.name}</p>
-                        <p className="text-[10px] text-slate-400">@{formatCurrency(item.unitPrice)}</p>
                       </td>
-                      <td className="px-4 py-3 sm:px-6 sm:py-5 text-center font-bold text-slate-600">{item.qty}</td>
+                      <td className="px-4 py-3 sm:px-6 sm:py-5 text-center font-bold text-slate-600">
+                        <div className="inline-flex items-center gap-2">
+                          <button onClick={() => decrementQty(item.id)} title="Reduce" className="px-2 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-md">-</button>
+                          <div className="px-2 font-mono text-sm">{item.qty}</div>
+                          <button onClick={() => incrementQty(item.id)} title="Increase" className="px-2 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-md">+</button>
+                          <button onClick={() => editQty(item.id)} title="Edit qty" className="px-2 py-1 bg-slate-50 hover:bg-slate-100 text-slate-500 rounded-md"><Pencil size={14} /></button>
+                        </div>
+                      </td>
+                      <td className="px-4 py-3 sm:px-8 sm:py-5 text-right font-black text-slate-900">
+                        <div className="inline-flex items-center justify-end gap-2">
+                          <div className="font-mono text-sm text-slate-600">{formatCurrency(item.unitPrice)}</div>
+                          <button onClick={() => editPrice(item.id)} title="Edit price" className="p-1 text-slate-400 hover:text-blue-600 hover:bg-slate-50 rounded-md">
+                            <Pencil size={14} />
+                          </button>
+                        </div>
+                      </td>
                       <td className="px-4 py-3 sm:px-10 sm:py-5 text-right font-black text-slate-900">{formatCurrency(item.total)}</td>
                       <td className="px-4 py-3 sm:px-10 sm:py-5 text-center">
-                        <button onClick={() => removeFromCart(item.id)} className="p-2 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-xl transition-all">
-                          <Trash size={16} />
-                        </button>
+                        <div className="flex items-center justify-center gap-2">
+                          <button onClick={() => removeFromCart(item.id)} title="Remove line" className="p-2 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-xl transition-all">
+                            <Trash size={16} />
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   ))}
@@ -1209,7 +1356,8 @@ const POSView = ({ products, onBulkSale, user }: any) => {
               <div className="border rounded-2xl p-4 bg-white">
                 <div className="text-center">
                   <p className="font-black text-slate-900">Samten Tshongkhang</p>
-                  <p className="text-[10px] font-bold text-slate-500">{new Date(receiptData.date).toLocaleString()}</p>
+            <p className="text-[10px] font-bold text-slate-500">Sunday Market, Thimphu, Bhutan</p>
+            <p className="text-[10px] font-bold text-slate-500">{new Date(receiptData.date).toLocaleString()}</p>
                 </div>
                 <div className="border-t my-3" />
                 <div className="space-y-2">
@@ -1271,11 +1419,12 @@ const printReceipt = (receipt: any) => {
         .line { margin: 6px 0; }
         table { width: 100%; border-collapse: collapse; }
         td { vertical-align: top; }
+        .meta { text-align: center; font-weight: bold; margin-bottom: 6px }
         @media print { @page { size: 72mm; margin: 4mm; } }
       </style>
     `;
     const itemsHtml = receipt.items.map((it: any) => `<tr><td>${it.name} (${it.qty}x)</td><td style="text-align:right">${formatCurrency(it.total)}</td></tr>`).join('');
-  const html = `<!doctype html><html><head><meta charset="utf-8"><title>Receipt</title>${styles}</head><body><div class="center"><h2>Samten Tshongkhang</h2><div class="line">Receipt #: ${receipt.id}</div><div class="line">${new Date(receipt.date).toLocaleString()}</div></div><hr/> <table>${itemsHtml}</table><hr/><div style="display:flex;justify-content:space-between;font-weight:bold"><div>Subtotal</div><div>${formatCurrency(receipt.subtotal)}</div></div><div style="display:flex;justify-content:space-between"><div>GST</div><div>${formatCurrency(receipt.gstAmount)}</div></div><div style="display:flex;justify-content:space-between;font-weight:bold;margin-top:8px"><div>Total</div><div>${formatCurrency(receipt.grandTotal)}</div></div><div class="center line">Thank you</div></body></html>`;
+  const html = `<!doctype html><html><head><meta charset="utf-8"><title>Receipt</title>${styles}</head><body><div class="center"><h2>Samten Tshongkhang</h2><div class="meta">Sunday Market, Thimphu, Bhutan</div><div class="line">Receipt #: ${receipt.id}</div><div class="line">${new Date(receipt.date).toLocaleString()}</div></div><hr/> <table>${itemsHtml}</table><hr/><div style="display:flex;justify-content:space-between;font-weight:bold"><div>Subtotal</div><div>${formatCurrency(receipt.subtotal)}</div></div><div style="display:flex;justify-content:space-between"><div>GST</div><div>${formatCurrency(receipt.gstAmount)}</div></div><div style="display:flex;justify-content:space-between;font-weight:bold;margin-top:8px"><div>Total</div><div>${formatCurrency(receipt.grandTotal)}</div></div><div class="center line">Thank you</div></body></html>`;
     win.document.write(html);
     win.document.close();
     win.focus();
@@ -1459,14 +1608,15 @@ const InventoryView = ({ products, onAdd, onEdit }: any) => {
   const exportAllLabels = () => {
     if (!products || products.length === 0) { alert('No products to export'); return; }
     const itemsHtml = products.map((p: Product) => {
-      const svg = p.barcodeSvg || generateBarcodeSvg(p.id, { height: 60, width: 2 });
+      // produce a slightly smaller barcode for better fit and readability
+      const svg = p.barcodeSvg || generateBarcodeSvg(p.id, { height: 48, width: 1.4 });
       // ensure the svg/html is safe to embed
       const content = String(svg);
       // one-column: each label is a full-width row
       return `
         <div class="label" style="display:block;width:100%;box-sizing:border-box;padding:12px 8px;border-bottom:1px solid #eee;page-break-inside:avoid;background:#fff;">
           <div style="display:flex;align-items:center;gap:12px;">
-            <div style="flex:0 0 160px;max-width:160px;overflow:hidden;background:#fff;padding:4px;border-radius:4px;">
+            <div style="flex:0 0 140px;max-width:140px;overflow:hidden;background:#fff;padding:4px;border-radius:4px;">
               <div style="width:100%;height:100%;display:block;">
                 ${content}
               </div>
